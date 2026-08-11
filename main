@@ -3847,12 +3847,30 @@ do
     -- Games usually already draw the fuel somewhere on the generator itself, so
     -- if there is no number to read, its own readout is the next best source.
     local function readLabelText(gen)
+        local fallback
+
         for _, child in ipairs(gen:GetDescendants()) do
             if (child:IsA("TextLabel") or child:IsA("TextButton")) and child.Text:find("%d") then
-                return child.Text
+                local text = child.Text
+                local lower = text:lower()
+
+                -- A distance readout is not fuel: "34m away", "12 studs", "34m".
+                local isDistance = lower:find("away", 1, true)
+                    or lower:find("stud", 1, true)
+                    or lower:match("^%s*%d+%s*m%s*$")
+
+                if not isDistance then
+                    -- Anything naming fuel, or shaped like 47/100 or 47%, wins
+                    -- outright; otherwise keep the first number seen as a guess.
+                    if lower:find("fuel", 1, true) or text:find("/") or text:find("%%") then
+                        return text
+                    end
+                    fallback = fallback or text
+                end
             end
         end
-        return nil
+
+        return fallback
     end
 
     local dumped = false
