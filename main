@@ -1,0 +1,4148 @@
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local CoreGui             = game:GetService("CoreGui")
+local Lighting            = game:GetService("Lighting")
+local RunService          = game:GetService("RunService")
+local UserInputService    = game:GetService("UserInputService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local TeleportService     = game:GetService("TeleportService")
+local HttpService         = game:GetService("HttpService")
+local Workspace           = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+local NIGHT3_PLACE_ID = 140260816701736
+
+local SUPPORTED_PLACES = {
+    [14896802601]      = "My Residence",
+    [16667550979]      = "My Residence",
+    [100255403764514]  = "The Bunker",
+    [NIGHT3_PLACE_ID]  = "Night 3",
+}
+
+if not SUPPORTED_PLACES[game.PlaceId] then
+    return
+end
+
+local CONFIG = {
+    -- A full Workspace:GetDescendants() is what used to cause the ESP stutter,
+    -- so it is now a rare resync (DescendantAdded catches everything between)
+    -- and it is spread over several frames instead of blocking one.
+    ESP_SWEEP_INTERVAL   = 15,
+    ESP_SWEEP_BUDGET     = 1500,
+    ESP_PLAYER_INTERVAL  = 1,
+    ESP_LABEL_INTERVAL   = 0.08,
+    ESP_MAX_DISTANCE     = 2000,
+    ACTION_TIMEOUT       = 5,
+    NOTIFY_TIME          = 4,
+    DEFAULT_SPRINT_SPEED = 17,
+    INF_VALUE            = 1e6,
+    SURVIVAL_INTERVAL    = 1,
+    PROMPT_INTERVAL      = 0.25,
+    THREAT_INTERVAL      = 0.25,
+    SETTINGS_FOLDER      = "SulfoxiumHubSettings",
+}
+
+local hiddenUI = (typeof(gethui) == "function" and gethui()) or CoreGui
+
+local Exec = {}
+do
+    local _fireclick    = fireclickdetector
+    local _fireprompt   = fireproximityprompt
+    local _mousemoverel = mousemoverel
+    local _setclipboard = setclipboard
+    local _writefile    = writefile
+    local _readfile     = readfile
+    local _isfile       = isfile
+    local _isfolder     = isfolder
+    local _makefolder   = makefolder
+    local _delfile      = delfile
+
+    function Exec.clickDetector(detector)
+        if typeof(_fireclick) ~= "function" or not detector then return false end
+        return (pcall(_fireclick, detector))
+    end
+
+    function Exec.proximityPrompt(prompt)
+        if typeof(_fireprompt) ~= "function" or not prompt then return false end
+        return (pcall(_fireprompt, prompt))
+    end
+
+    function Exec.mouseMoveRel(dx, dy)
+        if typeof(_mousemoverel) ~= "function" then return false end
+        return (pcall(_mousemoverel, dx, dy))
+    end
+
+    function Exec.clipboard(text)
+        if typeof(_setclipboard) ~= "function" then return false end
+        return (pcall(_setclipboard, text))
+    end
+
+    function Exec.ensureFolder(name)
+        if typeof(_isfolder) ~= "function" or typeof(_makefolder) ~= "function" then return false end
+        local ok, exists = pcall(_isfolder, name)
+        if ok and not exists then pcall(_makefolder, name) end
+        return true
+    end
+
+    function Exec.write(path, contents)
+        if typeof(_writefile) ~= "function" then return false end
+        return (pcall(_writefile, path, contents))
+    end
+
+    function Exec.read(path)
+        if typeof(_readfile) ~= "function" or typeof(_isfile) ~= "function" then return nil end
+        local ok, exists = pcall(_isfile, path)
+        if not ok or not exists then return nil end
+        local read, contents = pcall(_readfile, path)
+        return read and contents or nil
+    end
+
+    function Exec.delete(path)
+        if typeof(_delfile) ~= "function" then return false end
+        return (pcall(_delfile, path))
+    end
+
+    Exec.hasClick  = typeof(_fireclick) == "function"
+    Exec.hasPrompt = typeof(_fireprompt) == "function"
+    Exec.hasMouse  = typeof(_mousemoverel) == "function"
+    Exec.hasFiles  = typeof(_writefile) == "function" and typeof(_readfile) == "function"
+end
+
+local DrawingLib = nil
+do
+    if typeof(Drawing) == "table" or typeof(Drawing) == "userdata" then
+        local ok, obj = pcall(function() return Drawing.new("Line") end)
+        if ok and obj then
+            pcall(function() obj:Remove() end)
+            DrawingLib = Drawing
+        end
+    end
+end
+
+local Janitor = {}
+Janitor.__index = Janitor
+
+function Janitor.new()
+    return setmetatable({ _items = {}, _keyed = {} }, Janitor)
+end
+
+local function destroyItem(item)
+    if item == nil then return end
+    if typeof(item) == "RBXScriptConnection" then
+        pcall(function() item:Disconnect() end)
+    elseif typeof(item) == "Instance" then
+        pcall(function() item:Destroy() end)
+    elseif typeof(item) == "thread" then
+        pcall(task.cancel, item)
+    elseif typeof(item) == "function" then
+        pcall(item)
+    elseif typeof(item) == "table" then
+        if item.Clean then
+            pcall(function() item:Clean() end)
+        elseif item.Remove then
+            pcall(function() item:Remove() end)
+        end
+    end
+end
+
+function Janitor:Add(item, key)
+    if item == nil then return item end
+    if key then
+        self:Remove(key)
+        self._keyed[key] = item
+    else
+        table.insert(self._items, item)
+    end
+    return item
+end
+
+function Janitor:Has(key)
+    return self._keyed[key] ~= nil
+end
+
+function Janitor:Remove(key)
+    local item = self._keyed[key]
+    if item then
+        self._keyed[key] = nil
+        destroyItem(item)
+    end
+end
+
+function Janitor:Clean()
+    for i = #self._items, 1, -1 do
+        destroyItem(self._items[i])
+        self._items[i] = nil
+    end
+    for k, v in pairs(self._keyed) do
+        self._keyed[k] = nil
+        destroyItem(v)
+    end
+end
+
+local Master = Janitor.new()
+
+local Rayfield
+
+local function notify(text, duration)
+    if not Rayfield then return end
+    pcall(function()
+        Rayfield:Notify({
+            Title = "Sulfoxium Hub",
+            Content = tostring(text),
+            Duration = duration or CONFIG.NOTIFY_TIME,
+        })
+    end)
+end
+
+local function safe(fn, label)
+    return function(...)
+        local args = table.pack(...)
+        local ok, err = pcall(function()
+            return fn(table.unpack(args, 1, args.n))
+        end)
+        if not ok then
+            warn(("[Sulfoxium Hub] %s failed: %s"):format(label or "action", tostring(err)))
+            notify(("%s failed (see console)"):format(label or "Action"), 5)
+        end
+    end
+end
+
+local function spawnSafe(fn, label)
+    task.spawn(safe(fn, label))
+end
+
+local function tog(name)
+    local t = Toggles and Toggles[name]
+    return t ~= nil and t.Value == true
+end
+
+local function opt(name, fallback)
+    local o = Options and Options[name]
+    if o ~= nil and o.Value ~= nil then return o.Value end
+    return fallback
+end
+
+local function setToggle(name, value)
+    local t = Toggles and Toggles[name]
+    if t then pcall(function() t:SetValue(value) end) end
+end
+
+local function eachToggle(fn)
+    if not Toggles then return end
+    for name, toggle in pairs(Toggles) do
+        if typeof(toggle) == "table" then fn(name, toggle) end
+    end
+end
+
+local Char = {}
+
+function Char.get()
+    return LocalPlayer.Character
+end
+
+function Char.root()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+function Char.humanoid()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+
+function Char.alive()
+    local hum = Char.humanoid()
+    return hum ~= nil and hum.Health > 0
+end
+
+function Char.require()
+    local root = Char.root()
+    if not root then
+        error("character not ready", 0)
+    end
+    return LocalPlayer.Character, root
+end
+
+local Collision = {
+    original = setmetatable({}, { __mode = "k" }),
+    holders  = {},
+    count    = 0,
+}
+
+function Collision.capture(part)
+    if Collision.original[part] == nil then
+        Collision.original[part] = part.CanCollide
+    end
+end
+
+function Collision.apply()
+    local char = Char.get()
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            Collision.capture(part)
+            if part.CanCollide then
+                part.CanCollide = false
+            end
+        end
+    end
+end
+
+function Collision.restore()
+    for part, was in pairs(Collision.original) do
+        if typeof(part) == "Instance" and part.Parent then
+            pcall(function() part.CanCollide = was end)
+        end
+    end
+    Collision.original = setmetatable({}, { __mode = "k" })
+end
+
+function Collision.acquire(tag)
+    if Collision.holders[tag] then return end
+    Collision.holders[tag] = true
+    Collision.count += 1
+    if Collision.count == 1 then
+        Collision.apply()
+        Master:Add(RunService.Stepped:Connect(function()
+            Collision.apply()
+        end), "collisionLoop")
+    end
+end
+
+function Collision.release(tag)
+    if not Collision.holders[tag] then return end
+    Collision.holders[tag] = nil
+    Collision.count -= 1
+    if Collision.count <= 0 then
+        Collision.count = 0
+        Master:Remove("collisionLoop")
+        Collision.restore()
+    end
+end
+
+function Collision.releaseAll()
+    for tag in pairs(Collision.holders) do
+        Collision.holders[tag] = nil
+    end
+    Collision.count = 0
+    Master:Remove("collisionLoop")
+    Collision.restore()
+end
+
+function Collision.onRespawn()
+    Collision.original = setmetatable({}, { __mode = "k" })
+    if Collision.count > 0 then
+        Collision.apply()
+    end
+end
+
+local function zeroVelocity(root)
+    root.AssemblyLinearVelocity  = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+end
+
+local function pivotTo(cframe)
+    local char, root = Char.require()
+    char:PivotTo(cframe)
+    zeroVelocity(root)
+end
+
+local positionHistory = {}
+
+local function pushPosition()
+    local root = Char.root()
+    if root then
+        table.insert(positionHistory, root.CFrame)
+        if #positionHistory > 30 then
+            table.remove(positionHistory, 1)
+        end
+    end
+end
+
+local function popPosition()
+    local cf = table.remove(positionHistory)
+    if cf then
+        pivotTo(cf)
+        return true
+    end
+    return false
+end
+
+local function truthy(predicate)
+    if not predicate then return true end
+    local ok, value = pcall(predicate)
+    return ok and value and true or false
+end
+
+local function actUntil(action, predicate, timeout)
+    local deadline = os.clock() + (timeout or CONFIG.ACTION_TIMEOUT)
+    local attempts = 0
+
+    while true do
+        if truthy(predicate) then
+            return true, attempts
+        end
+        if os.clock() >= deadline then
+            return false, attempts
+        end
+        if action then
+            attempts += 1
+            pcall(action)
+        end
+        RunService.Heartbeat:Wait()
+    end
+end
+
+local function waitUntil(predicate, timeout)
+    return (actUntil(nil, predicate, timeout))
+end
+
+local function runAt(destination, action, predicate, timeout)
+    local char, root = Char.require()
+    local origin = root.CFrame
+
+    Collision.acquire("runAt")
+
+    local ok, done, attempts = pcall(function()
+        char:PivotTo(destination)
+        zeroVelocity(root)
+        return actUntil(action, predicate, timeout)
+    end)
+
+    if root.Parent then
+        root.CFrame = origin
+        zeroVelocity(root)
+    end
+    Collision.release("runAt")
+
+    if not ok then error(done, 0) end
+    return done, attempts
+end
+
+local function firePrompt(prompt)
+    if not prompt or not prompt.Parent or not prompt.Enabled then return false end
+
+    local hold, distance = prompt.HoldDuration, prompt.MaxActivationDistance
+    pcall(function()
+        prompt.HoldDuration = 0
+        prompt.MaxActivationDistance = math.huge
+    end)
+
+    local fired = Exec.proximityPrompt(prompt)
+
+    pcall(function()
+        prompt.HoldDuration = hold
+        prompt.MaxActivationDistance = distance
+    end)
+    return fired
+end
+
+local function interact(target)
+    if typeof(target) ~= "Instance" or not target.Parent then return false end
+
+    if target:IsA("ClickDetector") then return Exec.clickDetector(target) end
+    if target:IsA("ProximityPrompt") then return firePrompt(target) end
+
+    local click = target:FindFirstChildWhichIsA("ClickDetector", true)
+    if click and Exec.clickDetector(click) then return true end
+
+    local prompt = target:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if prompt and firePrompt(prompt) then return true end
+
+    return false
+end
+
+local function collectTriggers(root)
+    local triggers = {}
+    if not root then return triggers end
+    if root:IsA("ClickDetector") or root:IsA("ProximityPrompt") then
+        table.insert(triggers, root)
+    end
+    for _, child in ipairs(root:GetDescendants()) do
+        if child:IsA("ClickDetector") or child:IsA("ProximityPrompt") then
+            table.insert(triggers, child)
+        end
+    end
+    return triggers
+end
+
+local function triggersLive(triggers)
+    local live = 0
+    for _, trigger in ipairs(triggers) do
+        if trigger.Parent and not (trigger:IsA("ProximityPrompt") and not trigger.Enabled) then
+            live += 1
+        end
+    end
+    return live
+end
+
+local function toolSnapshot()
+    local snapshot = {}
+    local containers = { Char.get(), LocalPlayer:FindFirstChildOfClass("Backpack") }
+    for _, container in ipairs(containers) do
+        if container then
+            for _, item in ipairs(container:GetChildren()) do
+                if item:IsA("Tool") then snapshot[item] = true end
+            end
+        end
+    end
+    return snapshot
+end
+
+local function newToolSince(snapshot)
+    local containers = { Char.get(), LocalPlayer:FindFirstChildOfClass("Backpack") }
+    for _, container in ipairs(containers) do
+        if container then
+            for _, item in ipairs(container:GetChildren()) do
+                if item:IsA("Tool") and not snapshot[item] then return item end
+            end
+        end
+    end
+    return nil
+end
+
+local function toolGone(tool)
+    return not tool or not tool.Parent
+end
+
+local function mainPartOf(inst)
+    if inst:IsA("BasePart") then return inst end
+    if inst:IsA("Model") and inst.PrimaryPart then return inst.PrimaryPart end
+    if inst:IsA("Tool") then
+        local handle = inst:FindFirstChild("Handle")
+        if handle and handle:IsA("BasePart") then return handle end
+    end
+
+    local best, bestVolume
+    for _, child in ipairs(inst:GetDescendants()) do
+        if child:IsA("BasePart") then
+            local volume = child.Size.X * child.Size.Y * child.Size.Z
+            if not bestVolume or volume > bestVolume then
+                best, bestVolume = child, volume
+            end
+        end
+    end
+    return best
+end
+
+local function worldPosition(inst)
+    local part = mainPartOf(inst)
+    return part and part.Position
+end
+
+local function remotes()
+    return ReplicatedStorage:FindFirstChild("Remotes")
+end
+
+local function fireRemote(name, ...)
+    local folder = remotes()
+    local remote = folder and folder:FindFirstChild(name)
+    if not remote then
+        notify(("Remote '%s' not found in this place."):format(name), 5)
+        return false
+    end
+    remote:FireServer(...)
+    return true
+end
+
+local ACSuppressor = {
+    disabledScripts = {},
+    kickSwapped     = false,
+}
+
+local AC_SCRIPT_PATTERNS = { "anticheat", "anti_cheat", "security", "detect" }
+
+local function looksLikeACScript(name)
+    local lower = name:lower()
+    for _, pattern in ipairs(AC_SCRIPT_PATTERNS) do
+        if lower:find(pattern, 1, true) then return true end
+    end
+    return false
+end
+
+function ACSuppressor.swapKickRemote()
+    local folder = remotes()
+    if not folder then return false end
+    if folder:FindFirstChild("DisabledKick") then
+        ACSuppressor.kickSwapped = true
+        return true
+    end
+
+    local kick = folder:FindFirstChild("Kick")
+    if not kick then return false end
+
+    kick.Name = "DisabledKick"
+    local decoy = Instance.new("RemoteEvent")
+    decoy.Name = "Kick"
+    decoy.Parent = folder
+    Master:Add(decoy, "kickDecoy")
+    ACSuppressor.kickSwapped = true
+    return true
+end
+
+function ACSuppressor.disableLocalScripts()
+    local disabled = 0
+    local roots = { LocalPlayer:FindFirstChild("PlayerScripts"), LocalPlayer:FindFirstChild("PlayerGui") }
+    for _, root in ipairs(roots) do
+        if root then
+            for _, obj in ipairs(root:GetDescendants()) do
+                if obj:IsA("LocalScript") and not obj.Disabled and looksLikeACScript(obj.Name) then
+                    obj.Disabled = true
+                    table.insert(ACSuppressor.disabledScripts, obj)
+                    disabled += 1
+                end
+            end
+        end
+    end
+    return disabled
+end
+
+function ACSuppressor.run()
+    local swapped, count = false, 0
+    pcall(function() swapped = ACSuppressor.swapKickRemote() end)
+    pcall(function() count = ACSuppressor.disableLocalScripts() end)
+    return swapped, count
+end
+
+function ACSuppressor.restore()
+    if ACSuppressor.kickSwapped then
+        Master:Remove("kickDecoy")
+        local folder = remotes()
+        local real = folder and folder:FindFirstChild("DisabledKick")
+        if real then
+            local leftover = folder:FindFirstChild("Kick")
+            if leftover and leftover ~= real then
+                pcall(function() leftover:Destroy() end)
+            end
+            pcall(function() real.Name = "Kick" end)
+        end
+        ACSuppressor.kickSwapped = false
+    end
+
+    local restored = 0
+    for _, obj in ipairs(ACSuppressor.disabledScripts) do
+        if typeof(obj) == "Instance" and obj.Parent then
+            pcall(function() obj.Disabled = false end)
+            restored += 1
+        end
+    end
+    ACSuppressor.disabledScripts = {}
+    return restored
+end
+
+spawnSafe(function() ACSuppressor.run() end, "AC suppressor")
+
+local NIGHT1_SPOTS = {
+    { name = "Ladder",      cf = CFrame.new(-0.173666388, 9.29997444, -81.3216171, 0.71976018, 4.61229028e-08, -0.694222808, 2.05241513e-08, 1, 8.7717325e-08, 0.694222808, -7.73837669e-08, 0.71976018) },
+    { name = "Generator",   cf = CFrame.new(-79.722, 4.675, -131.918) },
+    { name = "Entrance",    cf = CFrame.new(-11.036, 7.73, -31.822) },
+    { name = "Living Room", cf = CFrame.new(-34.962, 8.05, -47.153) },
+    { name = "Bedroom",     cf = CFrame.new(-32.645, 23.8, -72.845) },
+}
+
+local NIGHT2_SPOTS = {
+    { name = "Entrance",       cf = CFrame.new(-217.417, 82.4, 65.412) },
+    { name = "Delivery Board", cf = CFrame.new(-282.224, 82.4, 14.674) },
+    { name = "Main",           cf = CFrame.new(-304.235, 82.4, -6.777) },
+    { name = "Corridor 1",     cf = CFrame.new(-303.846, 82.4, 50.169) },
+    { name = "Corridor 2",     cf = CFrame.new(-293.11, 82.4, -89.501) },
+    { name = "Safe Spot",      cf = CFrame.new(-339.321, 82.4, -40.622) },
+}
+
+local BUNKER_SPOTS = {
+    { name = "Safe Place", cf = CFrame.new(-25.3077145, 25.9999943, -150.490356, -0.601064324, -1.01536057e-09, -0.799200654, 1.33655895e-08, 1, -1.13224878e-08, 0.799200654, -1.13224878e-08, -0.601064324) },
+    { name = "End (use at 6AM)", cf = CFrame.new(16.2996006, 16.9999943, 68.173172, -0.944833934, -4.709448836e-08, 0.327549726, -3.33766472e-08, 1, 4.75014801e-08, -0.327549726, 3.33766472e-08, -0.944833934) },
+    { name = "Ventilation", cf = CFrame.new(68.3592224, 16.9999943, 74.6261444, -0.999991238, -9.77371215e-08, 0.00418279972, -9.77379742e-08, 1, 2.32150453e-13, -0.00418279972, 4.09047467e-11, -0.999991238) },
+}
+
+-- Anything added here shows up as a "TP: <name>" button automatically.
+local NIGHT3_SPOTS = {
+    { name = "Cabin 1", cf = CFrame.new(102.05, 4.46, -229.50) },
+    { name = "Cabin 2", cf = CFrame.new(-19.80, 4.45, 67.75) },
+    { name = "Cabin 3", cf = CFrame.new(-53.30, 4.45, 267.60) },
+    { name = "Cabin 4", cf = CFrame.new(231.84, 4.45, 229.05) },
+    { name = "Mansion", cf = CFrame.new(-227.51, 17.45, 52.76) },
+}
+
+local BUNKER_GENERATOR_CF = CFrame.new(-31.4144745, 13.3999977, -155.574509, -0.00836277846, 1.05214681e-08, 0.999965012, 1.05635436e-07, 1, -9.63839941e-09, -0.999965012, 1.05634229e-07, -0.00836277846)
+
+Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+-- Rayfield has no flags you can read back by name and no left/right groupboxes.
+-- These two registries and the group wrapper below keep the element API the rest
+-- of the file was written against, so every feature carries over unchanged:
+--   Toggles[id].Value / :SetValue(v)
+--   Options[id].Value  (sliders, dropdowns, inputs, colour pickers)
+Toggles = {}
+Options = {}
+
+-- Keybinds are handled with a plain input listener rather than Rayfield's
+-- CreateKeybind. LoadConfiguration replays saved flags and fires their
+-- callbacks, so a keybind bound to panic unloaded the whole menu the instant
+-- the script finished loading — the loading screen, then nothing.
+local KEYBINDS = {}
+local uiReady = false
+
+local Window = Rayfield:CreateWindow({
+    Name = ("Sulfoxium Hub — %s"):format(SUPPORTED_PLACES[game.PlaceId]),
+    Icon = 0,
+    LoadingTitle = "Sulfoxium Hub",
+    LoadingSubtitle = SUPPORTED_PLACES[game.PlaceId],
+    Theme = "Default",
+
+    DisableRayfieldPrompts = false,
+    DisableBuildWarnings = false,
+
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = CONFIG.SETTINGS_FOLDER,
+        FileName = "Sulfoxium " .. tostring(game.PlaceId),
+    },
+
+    Discord = {
+        Enabled = false,
+        Invite = "noinvitelink",
+        RememberJoins = true,
+    },
+
+    KeySystem = false,
+})
+
+local TAB_ICON = 4483362458
+
+-- Every element is created through here. Rayfield rejects option shapes that
+-- Linoria ignored, and an error while building one element used to abort the
+-- whole script before the window appeared — which is why nothing loaded. A
+-- failed element is now skipped and named in the console instead.
+local function create(tab, kind, payload)
+    local builder = tab and tab["Create" .. kind]
+    if not builder then
+        warn(("[Sulfoxium Hub] Rayfield has no Create%s"):format(kind))
+        return nil
+    end
+
+    local ok, element = pcall(builder, tab, payload)
+    if ok then return element end
+
+    warn(("[Sulfoxium Hub] Create%s failed for %s: %s")
+        :format(kind, tostring(typeof(payload) == "table" and payload.Name or payload), tostring(element)))
+    return nil
+end
+
+-- Rayfield sections are plain headers: everything added after one belongs to it
+-- until the next. The groupboxes are created up front but filled much later, so
+-- a section is only emitted when its group first receives an element, and again
+-- if another group interrupted it.
+local newGroup
+do
+    local function increment(rounding)
+        if not rounding or rounding <= 0 then return 1 end
+        return 1 / (10 ^ rounding)
+    end
+
+    local function register(store, id, value)
+        local entry = store[id]
+        if not entry then
+            entry = {}
+            store[id] = entry
+        end
+        entry.Value = value
+        return entry
+    end
+
+    function newGroup(tab, state, title)
+        local group = {}
+
+        local function open()
+            if state.current ~= group then
+                state.current = group
+                create(tab, "Section", title)
+            end
+        end
+
+        function group:AddButton(a, b)
+            open()
+
+            local text, func
+            if typeof(a) == "table" then
+                text, func = a.Text, a.Func
+            else
+                text, func = a, b
+            end
+
+            local button = create(tab, "Button", { Name = text, Callback = func })
+            return {
+                SetText = function(_, newText)
+                    if button then pcall(function() button:Set(newText) end) end
+                end,
+            }
+        end
+
+        function group:AddToggle(id, info)
+            open()
+
+            local entry = register(Toggles, id, info.Default == true)
+
+            local toggle = create(tab, "Toggle", {
+                Name = info.Text,
+                CurrentValue = info.Default == true,
+                Flag = id,
+                Callback = function(value)
+                    entry.Value = value
+                    if info.Callback then info.Callback(value) end
+                end,
+            })
+
+            entry.SetValue = function(_, value)
+                value = value == true
+                if toggle then
+                    pcall(function() toggle:Set(value) end)
+                end
+                entry.Value = value
+            end
+
+            -- Linoria hung a key picker off every toggle; only the ones that
+            -- asked for a real key get a bind, and it lives in the input
+            -- listener rather than in a Rayfield element.
+            entry.AddKeyPicker = function(_, keyId, keyInfo)
+                local default = keyInfo and keyInfo.Default
+                if not default or default == "None" then return end
+
+                KEYBINDS[default] = function()
+                    entry:SetValue(not entry.Value)
+                end
+            end
+
+            entry.AddColorPicker = function(_, colorId, colorInfo)
+                local colorEntry = register(Options, colorId, colorInfo.Default)
+
+                create(tab, "ColorPicker", {
+                    Name = colorInfo.Title or colorId,
+                    Color = colorInfo.Default,
+                    Flag = colorId,
+                    Callback = function(value)
+                        colorEntry.Value = value
+                        if colorInfo.Callback then colorInfo.Callback(value) end
+                    end,
+                })
+            end
+
+            return entry
+        end
+
+        function group:AddSlider(id, info)
+            open()
+
+            local entry = register(Options, id, info.Default)
+
+            create(tab, "Slider", {
+                Name = info.Text,
+                Range = { info.Min, info.Max },
+                Increment = increment(info.Rounding),
+                Suffix = info.Suffix or "",
+                CurrentValue = info.Default,
+                Flag = id,
+                Callback = function(value)
+                    entry.Value = value
+                    if info.Callback then info.Callback(value) end
+                end,
+            })
+
+            return entry
+        end
+
+        function group:AddDropdown(id, info)
+            open()
+
+            local values = info.Values or {}
+            local default = values[info.Default or 1]
+            local entry = register(Options, id, default)
+
+            local dropdown = create(tab, "Dropdown", {
+                Name = info.Text,
+                Options = values,
+                CurrentOption = default and { default } or {},
+                MultipleOptions = info.Multi == true,
+                Flag = id,
+                Callback = function(selection)
+                    -- Rayfield hands back a table even for single selection.
+                    local value = typeof(selection) == "table" and selection[1] or selection
+                    entry.Value = value
+                    if info.Callback then info.Callback(value) end
+                end,
+            })
+
+            entry.SetValues = function(_, newValues)
+                if not dropdown then return end
+                if pcall(function() dropdown:Refresh(newValues) end) then return end
+                pcall(function() dropdown:Refresh(newValues, {}) end)
+            end
+
+            return entry
+        end
+
+        function group:AddInput(id, info)
+            open()
+
+            local entry = register(Options, id, info.Default or "")
+
+            create(tab, "Input", {
+                Name = info.Text,
+                CurrentValue = info.Default or "",
+                PlaceholderText = info.Placeholder or "",
+                Numeric = false,
+                RemoveTextAfterFocusLost = false,
+                Flag = id,
+                Callback = function(text)
+                    entry.Value = text
+                    if info.Callback then info.Callback(text) end
+                end,
+            })
+
+            return entry
+        end
+
+        function group:AddLabel(text)
+            open()
+
+            local label = create(tab, "Label", text)
+            return {
+                SetText = function(_, newText)
+                    if label then pcall(function() label:Set(newText) end) end
+                end,
+            }
+        end
+
+        return group
+    end
+end
+
+local function newTab(name)
+    local ok, tab = pcall(function()
+        return Window:CreateTab(name, TAB_ICON)
+    end)
+    if not ok or not tab then
+        warn(("[Sulfoxium Hub] CreateTab failed for %s: %s"):format(name, tostring(tab)))
+        tab = Window:CreateTab(name)
+    end
+
+    local state = { current = nil }
+    return {
+        AddLeftGroupbox  = function(_, title) return newGroup(tab, state, title) end,
+        AddRightGroupbox = function(_, title) return newGroup(tab, state, title) end,
+        raw = tab,
+    }
+end
+
+local Tabs = {
+    Main     = newTab("Main"),
+    Visuals  = newTab("Visuals"),
+    Night1   = newTab("Night 1"),
+    Night2   = newTab("Night 2"),
+    Night3   = newTab("Night 3"),
+    Bunker   = newTab("The Bunker"),
+    Server   = newTab("Server"),
+    Settings = newTab("UI Settings"),
+}
+
+local function Button(group, text, tooltip, callback)
+    local wrapped = safe(callback, text)
+    local ok, btn = pcall(function()
+        return group:AddButton({ Text = text, Func = wrapped, Tooltip = tooltip })
+    end)
+    if ok then return btn end
+    return group:AddButton(text, wrapped)
+end
+
+local ToggleButtons = { list = {}, groups = {} }
+
+local function setButtonText(btn, text)
+    if typeof(btn) ~= "table" then return false end
+    if pcall(function() btn:SetText(text) end) then return true end
+    for _, value in pairs(btn) do
+        if typeof(value) == "Instance" and (value:IsA("TextLabel") or value:IsA("TextButton")) then
+            if pcall(function() value.Text = text end) then return true end
+        end
+    end
+    return false
+end
+
+local function clearToggleGroup(name, except)
+    local bucket = name and ToggleButtons.groups[name]
+    if not bucket then return end
+    for _, other in ipairs(bucket) do
+        if other ~= except and other.state then
+            other.state = false
+            other.refresh()
+        end
+    end
+end
+
+-- Press once to apply, press again to undo. `apply` may return false to say
+-- "nothing happened", in which case the button stays off.
+local function ToggleButton(group, text, tooltip, apply, revert, options)
+    options = options or {}
+
+    local handle = {
+        text  = text,
+        state = options.default == true,
+        busy  = false,
+    }
+
+    function handle.refresh()
+        setButtonText(handle.button, handle.state and ("[ON] " .. text) or text)
+    end
+
+    function handle:Set(state)
+        state = state == true
+        if handle.state == state then return end
+        handle.state = state
+        handle.refresh()
+    end
+
+    function handle:Revert()
+        if not handle.state or handle.busy then return end
+        handle.busy = true
+        local ok, err = pcall(revert)
+        handle.busy = false
+        handle.state = false
+        handle.refresh()
+        if not ok then
+            warn(("[Sulfoxium Hub] %s undo failed: %s"):format(text, tostring(err)))
+        end
+    end
+
+    handle.button = Button(group, text, tooltip, function()
+        if handle.busy then return end
+        handle.busy = true
+
+        local ok, err = pcall(function()
+            if handle.state then
+                revert()
+                handle.state = false
+            else
+                clearToggleGroup(handle.groupName, handle)
+                if apply() ~= false then
+                    handle.state = true
+                end
+            end
+        end)
+
+        handle.busy = false
+        handle.refresh()
+        if not ok then error(err, 0) end
+    end)
+
+    handle.keepOnReset = options.keepOnReset == true
+
+    if options.group then
+        local bucket = ToggleButtons.groups[options.group]
+        if not bucket then
+            bucket = {}
+            ToggleButtons.groups[options.group] = bucket
+        end
+        table.insert(bucket, handle)
+        handle.groupName = options.group
+    end
+
+    table.insert(ToggleButtons.list, handle)
+    handle.refresh()
+    return handle
+end
+
+local function revertToggleButtons()
+    for i = #ToggleButtons.list, 1, -1 do
+        local handle = ToggleButtons.list[i]
+        if handle.state and not handle.keepOnReset then
+            pcall(function() handle:Revert() end)
+        end
+    end
+end
+
+local function Toggle(group, id, info, defaultKey)
+    local toggle = group:AddToggle(id, info)
+    pcall(function()
+        toggle:AddKeyPicker(id .. "Key", {
+            Default = defaultKey or "None",
+            SyncToggleState = true,
+            Mode = "Toggle",
+            Text = info.Text,
+            NoUI = false,
+        })
+    end)
+    return toggle
+end
+
+local function setLabel(label, text)
+    if not label then return end
+    pcall(function() label:SetText(text) end)
+end
+
+local MovementGroup = Tabs.Main:AddLeftGroupbox("Movement")
+local SurvivalGroup = Tabs.Main:AddLeftGroupbox("Survival")
+local BypassGroup   = Tabs.Main:AddRightGroupbox("Bypass & Automation")
+local UtilityGroup  = Tabs.Main:AddRightGroupbox("Utility")
+
+local ESPGroup      = Tabs.Visuals:AddLeftGroupbox("ESP")
+local LightingGroup = Tabs.Visuals:AddRightGroupbox("Lighting")
+local CameraGroup   = Tabs.Visuals:AddRightGroupbox("Camera")
+
+local N1TPGroup  = Tabs.Night1:AddLeftGroupbox("Teleports")
+local N1ActGroup = Tabs.Night1:AddRightGroupbox("Actions")
+
+local N2TPGroup  = Tabs.Night2:AddLeftGroupbox("Teleports")
+local N2ActGroup = Tabs.Night2:AddRightGroupbox("Actions")
+
+local BunkerTPGroup  = Tabs.Bunker:AddLeftGroupbox("Teleports")
+local BunkerActGroup = Tabs.Bunker:AddRightGroupbox("Actions")
+
+local WaypointGroup = Tabs.Server:AddLeftGroupbox("Waypoints")
+local PlayerGroup   = Tabs.Server:AddLeftGroupbox("Players")
+local ServerGroup   = Tabs.Server:AddRightGroupbox("Server")
+local WatchGroup    = Tabs.Server:AddRightGroupbox("Watch")
+
+-- Plain buttons, not toggles: pressing a teleport twice should take you there
+-- twice, not bounce you back. "< Return" is the way back.
+local function buildTeleports(group, spots)
+    for _, spot in ipairs(spots) do
+        Button(group, "TP: " .. spot.name, "Teleport to " .. spot.name, function()
+            pushPosition()
+            pivotTo(spot.cf)
+            notify("Teleported to " .. spot.name)
+        end)
+    end
+
+    Button(group, "< Return", "Go back to your previous position", function()
+        if popPosition() then
+            notify("Returned to previous position")
+        else
+            notify("No saved position to return to.")
+        end
+    end)
+end
+
+buildTeleports(N1TPGroup, NIGHT1_SPOTS)
+buildTeleports(N2TPGroup, NIGHT2_SPOTS)
+buildTeleports(BunkerTPGroup, BUNKER_SPOTS)
+
+local baseWalkSpeed = 16
+local baseJumpPower = 50
+
+local function captureBaseStats()
+    local hum = Char.humanoid()
+    if not hum then return end
+    if hum.WalkSpeed > 0 and hum.WalkSpeed < 100 then
+        baseWalkSpeed = hum.WalkSpeed
+    end
+    if hum.UseJumpPower and hum.JumpPower > 0 and hum.JumpPower < 200 then
+        baseJumpPower = hum.JumpPower
+    end
+end
+
+local SPEED_MODES = { "Blink (stable)", "WalkSpeed (classic)", "Both" }
+
+Toggle(MovementGroup, "SpeedEnabled", {
+    Text = "Speed Hack",
+    Default = false,
+    Tooltip = "Blink mode teleports you forward in small steps, which keeps the camera steady",
+    Callback = function(state)
+        if not state then
+            local hum = Char.humanoid()
+            if hum then hum.WalkSpeed = baseWalkSpeed end
+        end
+        notify("Speed " .. (state and "enabled" or "restored"))
+    end,
+}, "V")
+
+MovementGroup:AddDropdown("SpeedMode", {
+    Values = SPEED_MODES,
+    Default = 1,
+    Multi = false,
+    Text = "Speed mode",
+})
+
+MovementGroup:AddSlider("BlinkDistance", {
+    Text = "Blink step",
+    Default = 1,
+    Min = 1,
+    Max = 18,
+    Rounding = 1,
+    Suffix = " studs",
+})
+
+MovementGroup:AddSlider("BlinkInterval", {
+    Text = "Blink delay",
+    Default = 0.02,
+    Min = 0.02,
+    Max = 0.4,
+    Rounding = 2,
+    Suffix = "s",
+})
+
+Toggle(MovementGroup, "BlinkPhase", {
+    Text = "Blink through walls",
+    Default = false,
+    Tooltip = "Skips the wall check so blinks pass through geometry",
+})
+
+local speedLabel = MovementGroup:AddLabel("Effective speed: --")
+
+MovementGroup:AddSlider("SpeedMultiplier", {
+    Text = "WalkSpeed multiplier",
+    Default = 3,
+    Min = 1,
+    Max = 8,
+    Rounding = 1,
+    Suffix = "x",
+})
+
+Toggle(MovementGroup, "SprintEnabled", {
+    Text = "Sprint Multiplier",
+    Default = false,
+    Tooltip = "Scales the game's SprintSpeed attribute",
+    Callback = function(state)
+        if not state then
+            local char = Char.get()
+            if char then char:SetAttribute("SprintSpeed", CONFIG.DEFAULT_SPRINT_SPEED) end
+        end
+    end,
+})
+
+MovementGroup:AddSlider("SprintMultiplier", {
+    Text = "Sprint multiplier",
+    Default = 1.5,
+    Min = 1,
+    Max = 4,
+    Rounding = 2,
+    Suffix = "x",
+})
+
+Toggle(MovementGroup, "JumpEnabled", {
+    Text = "Jump Power",
+    Default = false,
+    Callback = function(state)
+        local hum = Char.humanoid()
+        if hum and not state then
+            hum.UseJumpPower = true
+            hum.JumpPower = baseJumpPower
+        end
+    end,
+})
+
+MovementGroup:AddSlider("JumpPower", {
+    Text = "Jump power",
+    Default = 75,
+    Min = 30,
+    Max = 250,
+    Rounding = 0,
+})
+
+Toggle(MovementGroup, "Noclip", {
+    Text = "Noclip",
+    Default = false,
+    Tooltip = "Restores every part's original CanCollide when disabled",
+    Callback = function(state)
+        if state then
+            Collision.acquire("noclip")
+        else
+            Collision.release("noclip")
+        end
+        notify("Noclip " .. (state and "enabled" or "disabled"))
+    end,
+}, "N")
+
+Toggle(MovementGroup, "InfJump", {
+    Text = "Infinite Jump",
+    Default = false,
+    Callback = function(state)
+        if state then
+            Master:Add(UserInputService.JumpRequest:Connect(function()
+                if not tog("InfJump") then return end
+                local hum = Char.humanoid()
+                if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+            end), "infjump")
+        else
+            Master:Remove("infjump")
+        end
+    end,
+})
+
+Toggle(MovementGroup, "AntiFling", {
+    Text = "Anti-Fling",
+    Default = true,
+    Tooltip = "Clamps runaway velocity so physics can't launch you",
+})
+
+Toggle(MovementGroup, "AntiRagdoll", {
+    Text = "Anti-Ragdoll",
+    Default = false,
+    Tooltip = "Forces you back upright out of PlatformStand / FallingDown",
+})
+
+Button(MovementGroup, "Fix Sprint", "Nudges SprintSpeed to unstick the sprint script", function()
+    local char = Char.require()
+    char:SetAttribute("SprintSpeed", 16)
+    task.wait(0.1)
+    char:SetAttribute("SprintSpeed", CONFIG.DEFAULT_SPRINT_SPEED)
+    notify("Sprint reset.")
+end)
+
+local blinkParams = RaycastParams.new()
+do
+    local ok = pcall(function() blinkParams.FilterType = Enum.RaycastFilterType.Exclude end)
+    if not ok then
+        pcall(function() blinkParams.FilterType = Enum.RaycastFilterType.Blacklist end)
+    end
+end
+
+local blinkAccumulator = 0
+local speedLabelAccumulator = 0
+
+Master:Add(RunService.Heartbeat:Connect(function(dt)
+    local hum = Char.humanoid()
+    if not hum then return end
+    local root = Char.root()
+    if not root then return end
+    local char = hum.Parent
+
+    local mode = opt("SpeedMode", SPEED_MODES[1])
+    local speedOn = tog("SpeedEnabled")
+    local blinkOn = speedOn and (mode == SPEED_MODES[1] or mode == SPEED_MODES[3])
+    local classicOn = speedOn and (mode == SPEED_MODES[2] or mode == SPEED_MODES[3])
+
+    if blinkOn then
+        blinkAccumulator += dt
+        local interval = opt("BlinkInterval", 0.07)
+        if blinkAccumulator >= interval then
+            blinkAccumulator = 0
+            local direction = hum.MoveDirection
+            if direction.Magnitude > 0.05 then
+                local step = opt("BlinkDistance", 4)
+                local unit = direction.Unit
+                local delta = unit * step
+
+                if not (tog("Noclip") or tog("BlinkPhase")) then
+                    blinkParams.FilterDescendantsInstances = { char }
+                    local hit = Workspace:Raycast(root.Position, delta, blinkParams)
+                    if hit then
+                        local usable = (hit.Position - root.Position).Magnitude - 2
+                        delta = usable > 0 and unit * usable or Vector3.zero
+                    end
+                end
+
+                if delta.Magnitude > 0.01 then
+                    local vertical = root.AssemblyLinearVelocity.Y
+                    root.CFrame = root.CFrame + delta
+                    root.AssemblyLinearVelocity = Vector3.new(0, vertical, 0)
+                end
+            end
+        end
+    end
+
+    if classicOn then
+        local target = baseWalkSpeed * opt("SpeedMultiplier", 3)
+        if math.abs(hum.WalkSpeed - target) > 0.05 then
+            hum.WalkSpeed = target
+        end
+    elseif speedOn and math.abs(hum.WalkSpeed - baseWalkSpeed) > 0.05 then
+        hum.WalkSpeed = baseWalkSpeed
+    end
+
+    if tog("SprintEnabled") and char then
+        char:SetAttribute("SprintSpeed", hum.WalkSpeed * opt("SprintMultiplier", 1.5))
+    end
+
+    if tog("JumpEnabled") then
+        local power = opt("JumpPower", 75)
+        hum.UseJumpPower = true
+        if math.abs(hum.JumpPower - power) > 0.5 then
+            hum.JumpPower = power
+        end
+    end
+
+    if tog("AntiFling") then
+        local velocity = root.AssemblyLinearVelocity
+        if velocity.Magnitude > 250 then
+            root.AssemblyLinearVelocity = velocity.Unit * 60
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+
+    if tog("AntiRagdoll") then
+        if hum.PlatformStand then hum.PlatformStand = false end
+        local state = hum:GetState()
+        if state == Enum.HumanoidStateType.FallingDown or state == Enum.HumanoidStateType.Ragdoll then
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        end
+    end
+
+    speedLabelAccumulator += dt
+    if speedLabelAccumulator >= 0.4 then
+        speedLabelAccumulator = 0
+        if speedOn and (mode == SPEED_MODES[1] or mode == SPEED_MODES[3]) then
+            local effective = opt("BlinkDistance", 4) / math.max(opt("BlinkInterval", 0.07), 0.01)
+            setLabel(speedLabel, ("Effective speed: %.0f studs/s"):format(effective + (classicOn and hum.WalkSpeed or 0)))
+        else
+            setLabel(speedLabel, ("Effective speed: %.0f studs/s"):format(hum.WalkSpeed))
+        end
+    end
+end))
+
+local Survival = {}
+local SurvivalState = {}
+
+function Survival.infiniteStamina()
+    local char = Char.get()
+    if not char then return false end
+    local sprint = char:FindFirstChild("Sprint")
+    local stam = sprint and sprint:FindFirstChild("Stam")
+    if not stam then return false end
+
+    if not SurvivalState.stam or SurvivalState.stam.inst ~= stam then
+        SurvivalState.stam = {
+            inst  = stam,
+            max   = stam:GetAttribute("Max"),
+            value = stam.Value,
+        }
+    end
+
+    stam:SetAttribute("Max", CONFIG.INF_VALUE)
+    stam.Value = CONFIG.INF_VALUE
+    return true
+end
+
+function Survival.restoreStamina()
+    local saved = SurvivalState.stam
+    SurvivalState.stam = nil
+    if not saved or not saved.inst.Parent then return false end
+    pcall(function()
+        saved.inst:SetAttribute("Max", saved.max)
+        saved.inst.Value = saved.value
+    end)
+    return true
+end
+
+function Survival.infiniteOxygen()
+    local char = Char.get()
+    if not char then return false end
+    local breath = char:FindFirstChild("Breath")
+    if not breath then return false end
+
+    local blur = Lighting:FindFirstChild("Blur")
+    local sounds = Workspace:FindFirstChild("Sounds")
+    local breathSfx = sounds and sounds:FindFirstChild("HeavyBreath")
+
+    if not SurvivalState.breath or SurvivalState.breath.inst ~= breath then
+        local blurEnabled, sfxLooped
+        if blur then blurEnabled = blur.Enabled end
+        if breathSfx then sfxLooped = breathSfx.Looped end
+
+        SurvivalState.breath = {
+            inst      = breath,
+            max       = breath:GetAttribute("Max"),
+            value     = breath.Value,
+            blur      = blur,
+            blurOn    = blurEnabled,
+            sfx       = breathSfx,
+            sfxLooped = sfxLooped,
+        }
+    end
+
+    breath:SetAttribute("Max", CONFIG.INF_VALUE)
+    breath.Value = CONFIG.INF_VALUE
+
+    if blur then blur.Enabled = false end
+
+    if breathSfx then
+        breathSfx.Looped = false
+        breathSfx.Playing = false
+    end
+    return true
+end
+
+function Survival.restoreOxygen()
+    local saved = SurvivalState.breath
+    SurvivalState.breath = nil
+    if not saved then return false end
+
+    pcall(function()
+        if saved.inst.Parent then
+            saved.inst:SetAttribute("Max", saved.max)
+            saved.inst.Value = saved.value
+        end
+    end)
+    pcall(function()
+        if saved.blur and saved.blur.Parent and saved.blurOn ~= nil then
+            saved.blur.Enabled = saved.blurOn
+        end
+    end)
+    pcall(function()
+        if saved.sfx and saved.sfx.Parent and saved.sfxLooped ~= nil then
+            saved.sfx.Looped = saved.sfxLooped
+        end
+    end)
+    return true
+end
+
+function Survival.disableCold()
+    local char = Char.get()
+    if not char then return false end
+    local temp = char:FindFirstChild("Temperature")
+    if not temp then return false end
+    SurvivalState.cold = temp
+    temp.Enabled = false
+    return true
+end
+
+function Survival.enableCold()
+    local char = Char.get()
+    local temp = SurvivalState.cold or (char and char:FindFirstChild("Temperature"))
+    SurvivalState.cold = nil
+    if not temp or not temp.Parent then return false end
+    temp.Enabled = true
+    return true
+end
+
+function Survival.disableDeathHandler()
+    local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+    local handler = scripts and scripts:FindFirstChild("DeathHandler")
+    if not handler then return false end
+    SurvivalState.deathHandler = handler
+    handler.Enabled = false
+    return true
+end
+
+function Survival.enableDeathHandler()
+    local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+    local handler = SurvivalState.deathHandler or (scripts and scripts:FindFirstChild("DeathHandler"))
+    SurvivalState.deathHandler = nil
+    if not handler or not handler.Parent then return false end
+    handler.Enabled = true
+    return true
+end
+
+function Survival.topUpHealth()
+    local hum = Char.humanoid()
+    if not hum or hum.Health <= 0 then return false end
+    if hum.Health < hum.MaxHealth then
+        hum.Health = hum.MaxHealth
+    end
+    return true
+end
+
+local function survivalButton(text, tooltip, apply, revert, successMsg, revertMsg)
+    return ToggleButton(SurvivalGroup, text, tooltip, function()
+        if apply() then
+            notify(successMsg)
+            return true
+        end
+        notify("Not available in this place / not spawned yet.")
+        return false
+    end, function()
+        revert()
+        notify(revertMsg)
+    end)
+end
+
+survivalButton("Infinite Stamina",
+    "Sets Sprint.Stam to a huge value — press again to put the original value back",
+    Survival.infiniteStamina, Survival.restoreStamina,
+    "Infinite stamina applied.", "Stamina restored to normal.")
+
+survivalButton("Infinite Oxygen",
+    "Sets Breath to a huge value and kills the blur — press again to put it back",
+    Survival.infiniteOxygen, Survival.restoreOxygen,
+    "Infinite oxygen applied.", "Oxygen restored to normal.")
+
+survivalButton("Disable Cold",
+    "Disables the Temperature script — press again to re-enable it",
+    Survival.disableCold, Survival.enableCold,
+    "Freeze script disabled.", "Freeze script re-enabled.")
+
+survivalButton("Disable DeathHandler",
+    "Disables the DeathHandler LocalScript — press again to re-enable it",
+    Survival.disableDeathHandler, Survival.enableDeathHandler,
+    "DeathHandler disabled.", "DeathHandler re-enabled.")
+
+Toggle(SurvivalGroup, "SurvivalLoop", {
+    Text = "Keep Survival Stats Maxed",
+    Default = false,
+    Tooltip = "Re-applies stamina, oxygen and cold immunity on a timer",
+    Callback = function(state)
+        if not state then return end
+        spawnSafe(function()
+            while tog("SurvivalLoop") do
+                pcall(Survival.infiniteStamina)
+                pcall(Survival.infiniteOxygen)
+                pcall(Survival.disableCold)
+                task.wait(CONFIG.SURVIVAL_INTERVAL)
+            end
+        end, "Survival loop")
+    end,
+})
+
+Toggle(SurvivalGroup, "AutoHeal", {
+    Text = "Auto Heal",
+    Default = false,
+    Tooltip = "Restores health whenever it drops below maximum",
+    Callback = function(state)
+        if not state then return end
+        spawnSafe(function()
+            while tog("AutoHeal") do
+                pcall(Survival.topUpHealth)
+                task.wait(0.5)
+            end
+        end, "Auto heal")
+    end,
+})
+
+Toggle(SurvivalGroup, "AutoRespawn", {
+    Text = "Auto Respawn",
+    Default = false,
+    Tooltip = "Fires LoadCharacter shortly after you die",
+    Callback = function(state)
+        if state then
+            local hum = Char.humanoid()
+            if hum then
+                Master:Add(hum.Died:Connect(function()
+                    if not tog("AutoRespawn") then return end
+                    task.wait(2)
+                    fireRemote("LoadCharacter")
+                end), "autoRespawn")
+            end
+        else
+            Master:Remove("autoRespawn")
+        end
+    end,
+})
+
+Toggle(SurvivalGroup, "AutoReapply", {
+    Text = "Re-apply on respawn",
+    Default = true,
+    Tooltip = "Automatically restores stamina/oxygen/cold immunity after you respawn",
+})
+
+local respawnHooks = {}
+
+local function onCharacterAdded(char)
+    char:WaitForChild("HumanoidRootPart", 10)
+    char:WaitForChild("Humanoid", 10)
+    task.wait(0.5)
+
+    captureBaseStats()
+    Collision.onRespawn()
+
+    if tog("AutoRespawn") then
+        local hum = Char.humanoid()
+        if hum then
+            Master:Add(hum.Died:Connect(function()
+                if not tog("AutoRespawn") then return end
+                task.wait(2)
+                fireRemote("LoadCharacter")
+            end), "autoRespawn")
+        end
+    end
+
+    if tog("AutoReapply") then
+        pcall(Survival.infiniteStamina)
+        pcall(Survival.infiniteOxygen)
+        pcall(Survival.disableCold)
+    end
+
+    for _, hook in ipairs(respawnHooks) do
+        pcall(hook)
+    end
+end
+
+Master:Add(LocalPlayer.CharacterAdded:Connect(function(char)
+    spawnSafe(function() onCharacterAdded(char) end, "respawn handler")
+end))
+
+if LocalPlayer.Character then
+    captureBaseStats()
+end
+
+ToggleButton(BypassGroup, "Anti-Cheat Bypass",
+    "Renames the Kick remote and disables AC LocalScripts — press again to put them back",
+    function()
+        local swapped, count = ACSuppressor.run()
+        notify(("Bypass applied. Kick remote: %s | scripts disabled: %d")
+            :format(swapped and "swapped" or "not found", count), 5)
+    end,
+    function()
+        local restored = ACSuppressor.restore()
+        notify(("Bypass reverted. Kick remote restored | scripts re-enabled: %d")
+            :format(restored), 5)
+    end,
+    { default = true, keepOnReset = true })
+
+local closetBarriers = {}
+
+ToggleButton(BypassGroup, "Remove Closet Barriers",
+    "Detaches the Ignore part blocking closets — press again to put them back",
+    function()
+        local removed = 0
+        for _, obj in ipairs(Workspace:GetChildren()) do
+            if obj.Name == "Closet" then
+                local ignore = obj:FindFirstChild("Ignore")
+                if ignore then
+                    table.insert(closetBarriers, { inst = ignore, parent = obj })
+                    ignore.Parent = nil
+                    removed += 1
+                end
+            end
+        end
+        notify(("Cleared %d closet barrier(s)."):format(removed))
+    end,
+    function()
+        local restored = 0
+        for _, entry in ipairs(closetBarriers) do
+            if entry.parent and entry.parent.Parent then
+                if pcall(function() entry.inst.Parent = entry.parent end) then
+                    restored += 1
+                end
+            end
+        end
+        closetBarriers = {}
+        notify(("Restored %d closet barrier(s)."):format(restored))
+    end)
+
+Toggle(BypassGroup, "AutoWire", {
+    Text = "Auto-Wire",
+    Default = false,
+    Tooltip = "Automatically clicks sparking wires in the fuse box",
+    Callback = function(state)
+        if not state then return end
+        spawnSafe(function()
+            while tog("AutoWire") do
+                local folder = remotes()
+                local clickWire = folder and folder:FindFirstChild("ClickWire")
+                if not clickWire then
+                    notify("ClickWire remote missing — Auto-Wire disabled.", 5)
+                    setToggle("AutoWire", false)
+                    return
+                end
+
+                local fuseBox = Workspace:FindFirstChild("FuseBox")
+                local wires = fuseBox and fuseBox:FindFirstChild("Wires")
+                if wires then
+                    for _, wire in ipairs(wires:GetChildren()) do
+                        if not tog("AutoWire") then return end
+                        local sparkles = wire:FindFirstChild("Sparkles")
+                        if sparkles and sparkles.Enabled then
+                            clickWire:FireServer(wire)
+                            task.wait(0.5)
+                        end
+                    end
+                end
+                task.wait(0.4)
+            end
+        end, "AutoWire")
+    end,
+})
+
+Toggle(BypassGroup, "AutoPrompt", {
+    Text = "Auto Interact",
+    Default = false,
+    Tooltip = "Fires every ProximityPrompt within range automatically",
+    Callback = function(state)
+        if not state then return end
+        if not Exec.hasPrompt then
+            notify("Executor has no fireproximityprompt — Auto Interact disabled.", 5)
+            setToggle("AutoPrompt", false)
+            return
+        end
+        spawnSafe(function()
+            while tog("AutoPrompt") do
+                local root = Char.root()
+                if root then
+                    local range = opt("PromptRange", 18)
+                    for _, inst in ipairs(Workspace:GetDescendants()) do
+                        if not tog("AutoPrompt") then return end
+                        if inst:IsA("ProximityPrompt") and inst.Enabled then
+                            local parent = inst.Parent
+                            local pos = parent and worldPosition(parent)
+                            if pos and (pos - root.Position).Magnitude <= range then
+                                Exec.proximityPrompt(inst)
+                            end
+                        end
+                    end
+                end
+                task.wait(CONFIG.PROMPT_INTERVAL)
+            end
+        end, "Auto interact")
+    end,
+})
+
+BypassGroup:AddSlider("PromptRange", {
+    Text = "Interact range",
+    Default = 18,
+    Min = 5,
+    Max = 120,
+    Rounding = 0,
+    Suffix = " studs",
+})
+
+Toggle(BypassGroup, "EventNotifier", {
+    Text = "Larry Spawn Notifier",
+    Default = false,
+    Tooltip = "Notifies when the Mutant spawns or despawns",
+    Callback = function(state)
+        if state then
+            Master:Add(Workspace.ChildAdded:Connect(function(child)
+                if child.Name ~= "Mutant" then return end
+                local config = child:FindFirstChild("Config")
+                local wandering = config and config:FindFirstChild("Wandering")
+                if wandering then
+                    notify(wandering.Value and "Larry spawned OUTSIDE!" or "Larry spawned in a WINDOW!", 6)
+                else
+                    notify("Larry spawned!", 6)
+                end
+            end), "notifierAdd")
+
+            Master:Add(Workspace.ChildRemoved:Connect(function(child)
+                if child.Name == "Mutant" then
+                    notify("Larry despawned.", 4)
+                end
+            end), "notifierRemove")
+            notify("Spawn notifier enabled.")
+        else
+            Master:Remove("notifierAdd")
+            Master:Remove("notifierRemove")
+            notify("Spawn notifier disabled.")
+        end
+    end,
+})
+
+Toggle(BypassGroup, "AntiAFK", {
+    Text = "Anti-AFK",
+    Default = true,
+    Tooltip = "Prevents the 20-minute idle kick",
+    Callback = function(state)
+        if state then
+            Master:Add(LocalPlayer.Idled:Connect(function()
+                if not tog("AntiAFK") then return end
+                VirtualInputManager:SendMouseMoveEvent(0, 0, game)
+                task.wait(1)
+                VirtualInputManager:SendMouseMoveEvent(1, 1, game)
+            end), "antiafk")
+        else
+            Master:Remove("antiafk")
+        end
+    end,
+})
+
+setToggle("AntiAFK", true)
+
+local staticOverlay
+
+ToggleButton(UtilityGroup, "Disable Static Overlay",
+    "Hides the DialogueUI static effect — press again to show it",
+    function()
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        local dialogue = gui and gui:FindFirstChild("DialogueUI")
+        local static = dialogue and dialogue:FindFirstChild("Static")
+        if not static then
+            notify("Static overlay not found.")
+            return false
+        end
+        staticOverlay = static
+        static.Visible = false
+        notify("Static disabled.")
+    end,
+    function()
+        if staticOverlay and staticOverlay.Parent then
+            pcall(function() staticOverlay.Visible = true end)
+        end
+        staticOverlay = nil
+        notify("Static overlay restored.")
+    end)
+
+local mutedSounds = {}
+
+ToggleButton(UtilityGroup, "Mute All Game Sounds",
+    "Silences every SoundGroup and loose Sound — press again to bring the volume back",
+    function()
+        local muted = 0
+        for _, inst in ipairs(game:GetDescendants()) do
+            if inst:IsA("Sound") and inst.Volume > 0 then
+                table.insert(mutedSounds, { inst = inst, volume = inst.Volume })
+                inst.Volume = 0
+                muted += 1
+            end
+        end
+        notify(("Muted %d sound(s)."):format(muted))
+    end,
+    function()
+        local restored = 0
+        for _, entry in ipairs(mutedSounds) do
+            if entry.inst.Parent then
+                if pcall(function() entry.inst.Volume = entry.volume end) then
+                    restored += 1
+                end
+            end
+        end
+        mutedSounds = {}
+        notify(("Restored %d sound(s)."):format(restored))
+    end)
+
+Button(UtilityGroup, "Rejoin Server", "Teleports you back into the same place", function()
+    notify("Rejoining...", 3)
+    task.wait(0.5)
+    TeleportService:Teleport(game.PlaceId, LocalPlayer)
+end)
+
+UtilityGroup:AddLabel("Executor support:")
+UtilityGroup:AddLabel(("  ClickDetector: %s"):format(Exec.hasClick and "yes" or "NO"))
+UtilityGroup:AddLabel(("  ProximityPrompt: %s"):format(Exec.hasPrompt and "yes" or "NO"))
+UtilityGroup:AddLabel(("  mousemoverel: %s"):format(Exec.hasMouse and "yes" or "NO"))
+UtilityGroup:AddLabel(("  Drawing API: %s"):format(DrawingLib and "yes" or "NO"))
+UtilityGroup:AddLabel(("  File system: %s"):format(Exec.hasFiles and "yes" or "NO"))
+
+local ESP = {
+    active  = {},
+    enabled = {},
+    running = false,
+}
+
+local ESP_NAME_CATEGORIES = {}
+
+-- Anything sitting inside an object that is already highlighted is a duplicate
+-- of it: a handle inside its own model, a frame part inside the bed it belongs
+-- to, a gauge part inside the generator.
+local function notNestedInMatch(inst)
+    local parent = inst.Parent
+    while parent and parent ~= Workspace do
+        if ESP_NAME_CATEGORIES[parent.Name] then return false end
+        parent = parent.Parent
+    end
+    return true
+end
+
+local ESP_CATEGORIES = {
+    { key = "Players", text = "Players", default = Color3.fromRGB(80, 140, 255) },
+    { key = "Larry", text = "Larry (Mutant)", default = Color3.fromRGB(255, 60, 60), names = { Mutant = true } },
+    { key = "Stalker", text = "Stalker", default = Color3.fromRGB(255, 0, 200), names = { Stalker = true } },
+    { key = "Zombies", text = "Zombies", default = Color3.fromRGB(120, 255, 120), names = { Zombie = true, BloodZombie = true, FrozenZombie = true, FrozenBloodZombie = true } },
+    { key = "Abomination", text = "Abomination / Rat", default = Color3.fromRGB(255, 0, 255), names = { BunkerRat = true, Abomination = true, Monster = true } },
+    { key = "Generators", text = "Generators", default = Color3.fromRGB(255, 170, 0), names = { Generator = true, Gen = true } },
+    -- Night 3 scatters far more cans than the three that matter, so the toggle
+    -- is not offered there. Every other place keeps it.
+    { key = "Fuel", text = "Fuel / JerryCan", default = Color3.fromRGB(0, 255, 120), names = { JerryCan = true, Gasoline = true, Fuel = true }, hideIn = { [NIGHT3_PLACE_ID] = true } },
+    { key = "Monster", text = "Mutant Worker", default = Color3.fromRGB(255, 80, 0), names = { Mutant = true, Worker = true }, tab = "Night3" },
+    { key = "WorkerHead", text = "WorkerHead", default = Color3.fromRGB(255, 230, 0), names = { WorkerHead = true }, tab = "Night3" },
+    -- Wood and Log used to live here: they are not pickups, and bed frames are
+    -- built out of parts using those names, which is why beds lit up too.
+    { key = "Items", text = "Items / Pickups", default = Color3.fromRGB(255, 255, 120), names = { Battery = true, Flashlight = true, Medkit = true, Bandage = true, Key = true, Keycard = true, Marshmallow = true }, filter = notNestedInMatch },
+    { key = "Beds", text = "Beds", default = Color3.fromRGB(120, 200, 255), names = { Bed = true, Beds = true, BunkBed = true, Bunk = true }, filter = notNestedInMatch },
+}
+
+local THREAT_KEYS = { Larry = true, Stalker = true, Zombies = true, Abomination = true, Monster = true }
+
+-- name -> the categories claiming it. A sweep tests thousands of instances, so
+-- matching has to be one hash lookup rather than a walk over every category's
+-- name table. A name can belong to more than one category — "Mutant" is both
+-- Larry and Monster — so this holds a list and the enabled one wins.
+for _, cat in ipairs(ESP_CATEGORIES) do
+    if cat.names then
+        for name in pairs(cat.names) do
+            local claimed = ESP_NAME_CATEGORIES[name]
+            if claimed then
+                table.insert(claimed, cat)
+            else
+                ESP_NAME_CATEGORIES[name] = { cat }
+            end
+        end
+    end
+end
+
+local function espColor(key)
+    local value = opt("ESP_" .. key .. "Color")
+    if value then return value end
+    for _, cat in ipairs(ESP_CATEGORIES) do
+        if cat.key == key then return cat.default end
+    end
+    return Color3.new(1, 1, 1)
+end
+
+-- Your own character is drawn in dark green so it never reads as another player.
+local SELF_ESP_COLOR = Color3.fromRGB(0, 80, 20)
+
+local function makeEspEntry(inst, key, label, colorOverride)
+    local color = colorOverride or espColor(key)
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "RMx_ESP"
+    highlight.Adornee = inst
+    highlight.FillColor = color
+    highlight.OutlineColor = Color3.new(1, 1, 1)
+    highlight.FillTransparency = 0.6
+    highlight.OutlineTransparency = 0
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.Parent = hiddenUI
+
+    local adornPart = inst:IsA("Model")
+        and (inst:FindFirstChild("Head") or inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart"))
+        or inst
+
+    local billboard, textLabel
+    if adornPart and adornPart:IsA("BasePart") then
+        billboard = Instance.new("BillboardGui")
+        billboard.Name = "RMx_ESPLabel"
+        billboard.Adornee = adornPart
+        billboard.Size = UDim2.new(0, 220, 0, 34)
+        billboard.StudsOffset = Vector3.new(0, 2.5, 0)
+        billboard.AlwaysOnTop = true
+        billboard.Parent = hiddenUI
+
+        textLabel = Instance.new("TextLabel")
+        textLabel.BackgroundTransparency = 1
+        textLabel.Size = UDim2.fromScale(1, 1)
+        textLabel.Font = Enum.Font.GothamMedium
+        textLabel.TextSize = 13
+        textLabel.TextColor3 = color
+        textLabel.TextStrokeTransparency = 0.4
+        textLabel.Text = label or inst.Name
+        textLabel.Parent = billboard
+    end
+
+    return {
+        key           = key,
+        label         = label or inst.Name,
+        color         = color,
+        colorOverride = colorOverride,
+        highlight     = highlight,
+        billboard     = billboard,
+        text          = textLabel,
+        adornPart     = adornPart,
+        humanoid      = inst:IsA("Model") and inst:FindFirstChildOfClass("Humanoid") or nil,
+        tracer        = nil,
+    }
+end
+
+local function destroyTracer(entry)
+    if entry.tracer then
+        pcall(function() entry.tracer:Remove() end)
+        entry.tracer = nil
+    end
+end
+
+local function removeEspEntry(inst)
+    local entry = ESP.active[inst]
+    if not entry then return end
+    ESP.active[inst] = nil
+    destroyItem(entry.highlight)
+    destroyItem(entry.billboard)
+    destroyTracer(entry)
+end
+
+local function addEspEntry(inst, key, label, colorOverride)
+    ESP.active[inst] = makeEspEntry(inst, key, label, colorOverride)
+end
+
+local function categoryFor(inst)
+    -- Name first: it rejects almost every instance for the price of one lookup,
+    -- where IsA is a call into the engine for each of the two class tests.
+    local claimed = ESP_NAME_CATEGORIES[inst.Name]
+    if not claimed then return nil end
+    if not inst:IsA("Model") and not inst:IsA("BasePart") then return nil end
+
+    for _, cat in ipairs(claimed) do
+        if ESP.enabled[cat.key] and (not cat.filter or cat.filter(inst)) then
+            return cat.key
+        end
+    end
+    return nil
+end
+
+local function considerInstance(inst)
+    if ESP.active[inst] then return end
+    local key = categoryFor(inst)
+    if key then
+        addEspEntry(inst, key)
+    end
+end
+
+-- Cheap: at most a handful of players, safe to run every second. Your own
+-- character is included so you get the same box, outline and name tag.
+local function sweepPlayers()
+    if not ESP.enabled.Players then return end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local char = plr.Character
+        if char and not ESP.active[char] then
+            addEspEntry(char, "Players", plr.Name, plr == LocalPlayer and SELF_ESP_COLOR or nil)
+        end
+    end
+end
+
+-- Expensive: builds an array of every instance in the map. Yields every
+-- ESP_SWEEP_BUDGET instances so the cost lands across frames rather than as
+-- one visible hitch, and only runs as an occasional resync.
+local function sweepWorkspace()
+    local processed = 0
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if not ESP.running then return end
+        considerInstance(inst)
+        processed += 1
+        if processed >= CONFIG.ESP_SWEEP_BUDGET then
+            processed = 0
+            RunService.Heartbeat:Wait()
+        end
+    end
+    sweepPlayers()
+end
+
+local function pruneEsp()
+    for inst, entry in pairs(ESP.active) do
+        if not inst.Parent or not ESP.enabled[entry.key] then
+            removeEspEntry(inst)
+        end
+    end
+end
+
+local nearestThreat = { name = nil, distance = math.huge }
+
+local function startEsp()
+    if ESP.running then return end
+    ESP.running = true
+
+    Master:Add(Workspace.DescendantAdded:Connect(function(inst)
+        if not ESP.running then return end
+        -- This fires for every part the game streams in, so reject non-matches
+        -- here instead of paying for a deferred closure on each one.
+        if not ESP_NAME_CATEGORIES[inst.Name] then return end
+        task.defer(function()
+            if inst.Parent then considerInstance(inst) end
+        end)
+    end), "espAdded")
+
+    task.spawn(function()
+        while ESP.running do
+            pcall(sweepPlayers)
+            pcall(pruneEsp)
+            task.wait(CONFIG.ESP_PLAYER_INTERVAL)
+        end
+    end)
+
+    task.spawn(function()
+        while ESP.running do
+            task.wait(CONFIG.ESP_SWEEP_INTERVAL)
+            if ESP.running then pcall(sweepWorkspace) end
+        end
+    end)
+
+    local accumulator = CONFIG.ESP_LABEL_INTERVAL
+    Master:Add(RunService.RenderStepped:Connect(function(dt)
+        local camera = Workspace.CurrentCamera
+        local tracersOn = DrawingLib ~= nil and camera ~= nil and tog("ESPTracers")
+
+        accumulator += dt
+        local doLabels = accumulator >= CONFIG.ESP_LABEL_INTERVAL
+        if doLabels then accumulator = 0 end
+
+        -- With tracers off there is nothing to do on the frames between label
+        -- updates, so do not walk the entry list on them at all.
+        if not doLabels and not tracersOn then return end
+
+        local root = Char.root()
+        if not root then return end
+        local origin = root.Position
+        local maxDistance = opt("ESPDistance", CONFIG.ESP_MAX_DISTANCE)
+
+        -- Tracers start from the middle of the screen, where the crosshair sits
+        -- in first person, rather than from the bottom edge.
+        local viewport = camera and camera.ViewportSize
+        local tracerOrigin = viewport and Vector2.new(viewport.X / 2, viewport.Y / 2)
+        local closestName, closestDistance = nil, math.huge
+
+        for inst, entry in pairs(ESP.active) do
+            local part = entry.adornPart
+            if part and part.Parent then
+                local distance = (part.Position - origin).Magnitude
+                local visible = distance <= maxDistance
+
+                if doLabels then
+                    if THREAT_KEYS[entry.key] and distance < closestDistance then
+                        closestName, closestDistance = entry.label, distance
+                    end
+
+                    if entry.billboard then
+                        entry.billboard.Enabled = visible
+                        if visible and entry.text then
+                            local suffix = ""
+                            if entry.humanoid and entry.humanoid.Parent then
+                                suffix = (" | %d HP"):format(math.floor(entry.humanoid.Health))
+                            end
+                            entry.text.Text = ("%s  [%dm]%s"):format(entry.label, math.floor(distance), suffix)
+                        end
+                    end
+                end
+
+                if tracersOn and visible then
+                    if not entry.tracer then
+                        local ok, line = pcall(function() return DrawingLib.new("Line") end)
+                        if ok and line then
+                            line.Thickness = opt("TracerThickness", 1)
+                            line.Transparency = 1
+                            line.Color = entry.color
+                            entry.tracer = line
+                        end
+                    end
+                    local tracer = entry.tracer
+                    if tracer then
+                        local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
+                        if onScreen then
+                            tracer.From = tracerOrigin
+                            tracer.To = Vector2.new(screenPos.X, screenPos.Y)
+                            tracer.Visible = true
+                        else
+                            tracer.Visible = false
+                        end
+                    end
+                elseif entry.tracer then
+                    entry.tracer.Visible = false
+                end
+            end
+        end
+
+        if doLabels then
+            nearestThreat.name = closestName
+            nearestThreat.distance = closestDistance
+        end
+    end), "espLabels")
+end
+
+local function stopEspIfIdle()
+    for _, enabled in pairs(ESP.enabled) do
+        if enabled then return end
+    end
+    ESP.running = false
+    Master:Remove("espAdded")
+    Master:Remove("espLabels")
+    for inst in pairs(ESP.active) do
+        removeEspEntry(inst)
+    end
+    nearestThreat.name = nil
+    nearestThreat.distance = math.huge
+end
+
+-- Shared so a category can be placed in another tab's groupbox and still be a
+-- normal ESP toggle. Categories tagged with a tab are built by that tab.
+local function buildEspToggle(group, cat)
+    local toggle = Toggle(group, "ESP_" .. cat.key, {
+        Text = cat.text,
+        Default = false,
+        Callback = function(state)
+            ESP.enabled[cat.key] = state
+            if state then
+                startEsp()
+                spawnSafe(sweepWorkspace, "ESP sweep")
+            else
+                pruneEsp()
+                stopEspIfIdle()
+            end
+        end,
+    })
+
+    pcall(function()
+        toggle:AddColorPicker("ESP_" .. cat.key .. "Color", {
+            Default = cat.default,
+            Title = cat.text .. " colour",
+            Callback = function(color)
+                for _, entry in pairs(ESP.active) do
+                    -- Your own character keeps its dark green whatever the
+                    -- Players colour is set to.
+                    if entry.key == cat.key and not entry.colorOverride then
+                        entry.color = color
+                        entry.highlight.FillColor = color
+                        if entry.text then entry.text.TextColor3 = color end
+                        if entry.tracer then entry.tracer.Color = color end
+                    end
+                end
+            end,
+        })
+    end)
+
+    return toggle
+end
+
+for _, cat in ipairs(ESP_CATEGORIES) do
+    local hidden = cat.hideIn and cat.hideIn[game.PlaceId]
+    if not cat.tab and not hidden then
+        buildEspToggle(ESPGroup, cat)
+    end
+end
+
+Toggle(ESPGroup, "ESPTracers", {
+    Text = "Tracers",
+    Default = false,
+    Tooltip = DrawingLib and "Redraws every frame so lines stay glued to the target" or "Unsupported: no Drawing API",
+    Callback = function(state)
+        if state and not DrawingLib then
+            notify("Executor has no Drawing API — tracers unavailable.", 5)
+            setToggle("ESPTracers", false)
+            return
+        end
+        if not state then
+            for _, entry in pairs(ESP.active) do
+                destroyTracer(entry)
+            end
+        end
+    end,
+})
+
+ESPGroup:AddSlider("TracerThickness", {
+    Text = "Tracer thickness",
+    Default = 1,
+    Min = 1,
+    Max = 5,
+    Rounding = 0,
+    Callback = function(value)
+        for _, entry in pairs(ESP.active) do
+            if entry.tracer then entry.tracer.Thickness = value end
+        end
+    end,
+})
+
+ESPGroup:AddSlider("ESPDistance", {
+    Text = "Label distance",
+    Default = CONFIG.ESP_MAX_DISTANCE,
+    Min = 100,
+    Max = 5000,
+    Rounding = 0,
+    Suffix = "m",
+})
+
+-- Categories tagged with a tab live in that tab, so this only covers the ones
+-- shown here plus tracers. Anything already on means the press turns all off.
+Button(ESPGroup, "Toggle All ESP", "Turns every ESP in this tab and tracers on, or all off", function()
+    local anyOn = tog("ESPTracers")
+
+    if not anyOn then
+        for _, cat in ipairs(ESP_CATEGORIES) do
+            if not cat.tab and tog("ESP_" .. cat.key) then
+                anyOn = true
+                break
+            end
+        end
+    end
+
+    local target = not anyOn
+    for _, cat in ipairs(ESP_CATEGORIES) do
+        if not cat.tab then
+            setToggle("ESP_" .. cat.key, target)
+        end
+    end
+    setToggle("ESPTracers", target)
+
+    notify(target and "All ESP enabled." or "All ESP disabled.")
+end)
+
+Button(ESPGroup, "Clear All ESP", "Disables every ESP category", function()
+    for _, cat in ipairs(ESP_CATEGORIES) do
+        setToggle("ESP_" .. cat.key, false)
+    end
+    setToggle("ESPTracers", false)
+    notify("ESP cleared.")
+end)
+
+local LightingState = { snapshot = nil, effectStates = nil }
+
+local LIGHTING_PROPS = {
+    "Brightness", "FogEnd", "FogStart", "GlobalShadows",
+    "Ambient", "OutdoorAmbient", "ShadowSoftness", "ExposureCompensation",
+}
+
+local function snapshotLighting()
+    if LightingState.snapshot then return end
+
+    local snap = {}
+    for _, prop in ipairs(LIGHTING_PROPS) do
+        local ok, value = pcall(function() return Lighting[prop] end)
+        if ok then snap[prop] = value end
+    end
+    LightingState.snapshot = snap
+
+    local states = {}
+    for _, child in ipairs(Lighting:GetChildren()) do
+        if child:IsA("BlurEffect") or child:IsA("Atmosphere") or child:IsA("Sky")
+            or child:IsA("ColorCorrectionEffect") then
+            states[child] = child.Enabled
+        end
+    end
+    LightingState.effectStates = states
+end
+
+local function suppressEffects()
+    for _, child in ipairs(Lighting:GetChildren()) do
+        if child:IsA("BlurEffect") or child:IsA("Atmosphere") or child:IsA("Sky") then
+            if LightingState.effectStates and LightingState.effectStates[child] == nil then
+                LightingState.effectStates[child] = child.Enabled
+            end
+            child.Enabled = false
+        end
+    end
+    local gui = LocalPlayer:FindFirstChild("PlayerGui")
+    if gui then
+        for _, obj in ipairs(gui:GetDescendants()) do
+            if obj:IsA("BlurEffect") then obj.Enabled = false end
+        end
+    end
+end
+
+local FULLBRIGHT_MAX = 6
+
+local PURE_EFFECT_CLASSES = {
+    "BlurEffect", "ColorCorrectionEffect", "SunRaysEffect", "BloomEffect",
+    "DepthOfFieldEffect", "Atmosphere", "Sky",
+}
+
+local Pure = {
+    active  = false,
+    effects = setmetatable({}, { __mode = "k" }),
+    parts   = setmetatable({}, { __mode = "k" }),
+    lights  = setmetatable({}, { __mode = "k" }),
+    props   = nil,
+}
+
+local function isPureEffect(inst)
+    for _, className in ipairs(PURE_EFFECT_CLASSES) do
+        if inst:IsA(className) then return true end
+    end
+    return false
+end
+
+local function pureKillEffect(inst)
+    if not isPureEffect(inst) then return end
+    if Pure.effects[inst] == nil then
+        Pure.effects[inst] = inst.Enabled
+    end
+    if inst.Enabled then inst.Enabled = false end
+end
+
+local function pureStripShadows(inst)
+    if inst:IsA("BasePart") then
+        if Pure.parts[inst] == nil then
+            Pure.parts[inst] = inst.CastShadow
+        end
+        if inst.CastShadow then inst.CastShadow = false end
+    elseif inst:IsA("Light") then
+        if Pure.lights[inst] == nil then
+            Pure.lights[inst] = inst.Shadows
+        end
+        if inst.Shadows then inst.Shadows = false end
+    end
+end
+
+local function pureSweep()
+    for _, container in ipairs({ Lighting, Workspace.CurrentCamera, LocalPlayer:FindFirstChild("PlayerGui") }) do
+        if container then
+            for _, inst in ipairs(container:GetDescendants()) do
+                pureKillEffect(inst)
+            end
+        end
+    end
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        pureKillEffect(inst)
+        pureStripShadows(inst)
+    end
+end
+
+local function pureApplyProps()
+    Lighting.GlobalShadows = false
+    Lighting.ShadowSoftness = 0
+    Lighting.FogStart = 1e6
+    Lighting.FogEnd = 1e6
+    Lighting.Ambient = Color3.new(1, 1, 1)
+    Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+    Lighting.ColorShift_Top = Color3.new(1, 1, 1)
+    Lighting.ColorShift_Bottom = Color3.new(1, 1, 1)
+    pcall(function() Lighting.EnvironmentDiffuseScale = 1 end)
+    pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
+    pcall(function() Lighting.ExposureCompensation = 0 end)
+end
+
+function Pure.enable()
+    if Pure.active then return end
+    Pure.active = true
+
+    Pure.props = {}
+    for _, prop in ipairs({ "ColorShift_Top", "ColorShift_Bottom", "EnvironmentDiffuseScale", "EnvironmentSpecularScale" }) do
+        local ok, value = pcall(function() return Lighting[prop] end)
+        if ok then Pure.props[prop] = value end
+    end
+
+    pureApplyProps()
+    pureSweep()
+
+    Master:Add(Workspace.DescendantAdded:Connect(function(inst)
+        if not Pure.active then return end
+        task.defer(function()
+            if not inst.Parent then return end
+            pureKillEffect(inst)
+            pureStripShadows(inst)
+        end)
+    end), "pureAdded")
+
+    Master:Add(Lighting.DescendantAdded:Connect(function(inst)
+        if not Pure.active then return end
+        task.defer(function()
+            if inst.Parent then pureKillEffect(inst) end
+        end)
+    end), "pureLighting")
+
+    local accumulator = 0
+    Master:Add(RunService.Heartbeat:Connect(function(dt)
+        if not Pure.active then return end
+        accumulator += dt
+        if accumulator < 2 then return end
+        accumulator = 0
+        pureApplyProps()
+        pureSweep()
+    end), "pureHold")
+end
+
+function Pure.disable()
+    if not Pure.active then return end
+    Pure.active = false
+
+    Master:Remove("pureAdded")
+    Master:Remove("pureLighting")
+    Master:Remove("pureHold")
+
+    for inst, wasEnabled in pairs(Pure.effects) do
+        if typeof(inst) == "Instance" and inst.Parent then
+            pcall(function() inst.Enabled = wasEnabled end)
+        end
+    end
+    for part, castShadow in pairs(Pure.parts) do
+        if typeof(part) == "Instance" and part.Parent then
+            pcall(function() part.CastShadow = castShadow end)
+        end
+    end
+    for light, shadows in pairs(Pure.lights) do
+        if typeof(light) == "Instance" and light.Parent then
+            pcall(function() light.Shadows = shadows end)
+        end
+    end
+    if Pure.props then
+        for prop, value in pairs(Pure.props) do
+            pcall(function() Lighting[prop] = value end)
+        end
+    end
+
+    Pure.effects = setmetatable({}, { __mode = "k" })
+    Pure.parts = setmetatable({}, { __mode = "k" })
+    Pure.lights = setmetatable({}, { __mode = "k" })
+    Pure.props = nil
+end
+
+local FULLBRIGHT_PROPS = {
+    Brightness = true, FogEnd = true, GlobalShadows = true,
+    Ambient = true, OutdoorAmbient = true, ShadowSoftness = true,
+}
+
+-- One setting, fully on: brightness at the top of the range and pure mode with
+-- it, so every shadow, blur and post effect is stripped rather than dimmed.
+local function applyFullbright()
+    Lighting.Brightness = FULLBRIGHT_MAX
+    Lighting.FogEnd = 1e6
+    Lighting.GlobalShadows = false
+    Lighting.Ambient = Color3.fromRGB(255, 255, 255)
+    Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+    Lighting.ShadowSoftness = 0
+
+    Pure.enable()
+end
+
+local function restoreLighting()
+    Pure.disable()
+    if not LightingState.snapshot then return end
+    for prop, value in pairs(LightingState.snapshot) do
+        pcall(function() Lighting[prop] = value end)
+    end
+    if LightingState.effectStates then
+        for effect, wasEnabled in pairs(LightingState.effectStates) do
+            if effect.Parent then
+                pcall(function() effect.Enabled = wasEnabled end)
+            end
+        end
+    end
+    LightingState.snapshot = nil
+    LightingState.effectStates = nil
+end
+
+Toggle(LightingGroup, "Fullbright", {
+    Text = "Fullbright",
+    Default = false,
+    Tooltip = "Full brightness with every shadow, blur and post-effect stripped",
+    Callback = function(state)
+        if state then
+            snapshotLighting()
+            applyFullbright()
+            suppressEffects()
+
+            Master:Add(Lighting.Changed:Connect(function(property)
+                if FULLBRIGHT_PROPS[property] and tog("Fullbright") then
+                    applyFullbright()
+                end
+            end), "fbChanged")
+
+            Master:Add(Lighting.ChildAdded:Connect(function(child)
+                if not tog("Fullbright") then return end
+                task.defer(function()
+                    if child:IsA("BlurEffect") or child:IsA("Atmosphere") or child:IsA("Sky") then
+                        if LightingState.effectStates then
+                            LightingState.effectStates[child] = child.Enabled
+                        end
+                        child.Enabled = false
+                    end
+                end)
+            end), "fbChildAdded")
+
+            notify("Fullbright enabled.")
+        else
+            Master:Remove("fbChanged")
+            Master:Remove("fbChildAdded")
+            restoreLighting()
+            notify("Fullbright disabled.")
+        end
+    end,
+})
+
+local CameraState = { defaultMin = 0.5, defaultMax = 128 }
+
+do
+    CameraState.defaultMin = LocalPlayer.CameraMinZoomDistance
+    CameraState.defaultMax = LocalPlayer.CameraMaxZoomDistance
+end
+
+Toggle(CameraGroup, "UnlockZoom", {
+    Text = "Unlock Camera Zoom",
+    Default = false,
+    Callback = function(state)
+        if state then
+            LocalPlayer.CameraMinZoomDistance = 0.5
+            LocalPlayer.CameraMaxZoomDistance = 1000
+        else
+            LocalPlayer.CameraMinZoomDistance = CameraState.defaultMin
+            LocalPlayer.CameraMaxZoomDistance = CameraState.defaultMax
+        end
+    end,
+})
+
+Toggle(CameraGroup, "ThirdPerson", {
+    Text = "Force Third Person",
+    Default = false,
+    Tooltip = "Puts your camera mode and zoom back exactly as they were when you switched it on",
+    Callback = function(state)
+        if state then
+            -- Snapshot live values, not the ones captured at script load: the
+            -- game locks you into first person during Night 1/2, so those are
+            -- what has to come back when this is switched off.
+            CameraState.savedMode = LocalPlayer.CameraMode
+            CameraState.savedMin  = LocalPlayer.CameraMinZoomDistance
+
+            LocalPlayer.CameraMode = Enum.CameraMode.Classic
+            LocalPlayer.CameraMinZoomDistance = 8
+
+            Master:Add(RunService.Heartbeat:Connect(function()
+                if not tog("ThirdPerson") then return end
+                if LocalPlayer.CameraMode ~= Enum.CameraMode.Classic then
+                    LocalPlayer.CameraMode = Enum.CameraMode.Classic
+                end
+            end), "thirdPerson")
+        else
+            Master:Remove("thirdPerson")
+
+            if CameraState.savedMode then
+                LocalPlayer.CameraMode = CameraState.savedMode
+            end
+
+            -- Unlock Camera Zoom owns the minimum while it is on, so leave its
+            -- value alone and only restore the zoom this toggle overwrote.
+            if not tog("UnlockZoom") then
+                LocalPlayer.CameraMinZoomDistance = CameraState.savedMin or CameraState.defaultMin
+            end
+
+            CameraState.savedMode = nil
+            CameraState.savedMin  = nil
+        end
+    end,
+})
+
+local WAYPOINT_PATH = CONFIG.SETTINGS_FOLDER .. "/waypoints_" .. tostring(game.PlaceId) .. ".json"
+local waypoints = {}
+local waypointDropdown
+
+local function waypointNames()
+    local names = {}
+    for name in pairs(waypoints) do
+        table.insert(names, name)
+    end
+    table.sort(names)
+    return names
+end
+
+local function refreshWaypointDropdown()
+    if not waypointDropdown then return end
+    local names = waypointNames()
+    if #names == 0 then names = { "(none)" } end
+    pcall(function() waypointDropdown:SetValues(names) end)
+end
+
+local function saveWaypoints()
+    if not Exec.hasFiles then return false end
+    Exec.ensureFolder(CONFIG.SETTINGS_FOLDER)
+    local serialised = {}
+    for name, cf in pairs(waypoints) do
+        serialised[name] = { cf:GetComponents() }
+    end
+    local ok, encoded = pcall(function() return HttpService:JSONEncode(serialised) end)
+    if not ok then return false end
+    return Exec.write(WAYPOINT_PATH, encoded)
+end
+
+local function loadWaypoints()
+    if not Exec.hasFiles then return end
+    local contents = Exec.read(WAYPOINT_PATH)
+    if not contents then return end
+    local ok, decoded = pcall(function() return HttpService:JSONDecode(contents) end)
+    if not ok or typeof(decoded) ~= "table" then return end
+    for name, components in pairs(decoded) do
+        if typeof(components) == "table" and #components == 12 then
+            waypoints[name] = CFrame.new(table.unpack(components))
+        end
+    end
+end
+
+loadWaypoints()
+
+WaypointGroup:AddInput("WaypointName", {
+    Text = "Waypoint name",
+    Default = "",
+    Placeholder = "e.g. hiding spot",
+})
+
+waypointDropdown = WaypointGroup:AddDropdown("WaypointList", {
+    Values = (function()
+        local names = waypointNames()
+        return #names > 0 and names or { "(none)" }
+    end)(),
+    Default = 1,
+    Multi = false,
+    Text = "Saved waypoints",
+})
+
+Button(WaypointGroup, "Save Current Position", "Stores your position under the name above", function()
+    local name = opt("WaypointName", "")
+    if name == nil or name == "" then
+        return notify("Type a waypoint name first.")
+    end
+    local _, root = Char.require()
+    waypoints[name] = root.CFrame
+    refreshWaypointDropdown()
+    notify(saveWaypoints() and ("Saved waypoint '%s'."):format(name) or ("Saved '%s' (session only)."):format(name))
+end)
+
+Button(WaypointGroup, "Teleport To Waypoint", "Go to the selected waypoint", function()
+    local name = opt("WaypointList")
+    local cf = name and waypoints[name]
+    if not cf then return notify("No waypoint selected.") end
+    pushPosition()
+    pivotTo(cf)
+    notify("Teleported to " .. name)
+end)
+
+Button(WaypointGroup, "< Return", "Go back to your previous position", function()
+    if popPosition() then
+        notify("Returned to previous position")
+    else
+        notify("No saved position to return to.")
+    end
+end)
+
+Button(WaypointGroup, "Delete Waypoint", nil, function()
+    local name = opt("WaypointList")
+    if not name or not waypoints[name] then return notify("No waypoint selected.") end
+    waypoints[name] = nil
+    refreshWaypointDropdown()
+    saveWaypoints()
+    notify("Deleted " .. name)
+end)
+
+Button(WaypointGroup, "Clear All Waypoints", nil, function()
+    waypoints = {}
+    refreshWaypointDropdown()
+    Exec.delete(WAYPOINT_PATH)
+    notify("All waypoints cleared.")
+end)
+
+local playerDropdown
+
+local function playerNames()
+    local names = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            table.insert(names, plr.Name)
+        end
+    end
+    table.sort(names)
+    if #names == 0 then names = { "(nobody)" } end
+    return names
+end
+
+local function refreshPlayerDropdown()
+    if not playerDropdown then return end
+    pcall(function() playerDropdown:SetValues(playerNames()) end)
+end
+
+playerDropdown = PlayerGroup:AddDropdown("PlayerList", {
+    Values = playerNames(),
+    Default = 1,
+    Multi = false,
+    Text = "Player",
+})
+
+Button(PlayerGroup, "Refresh List", nil, function()
+    refreshPlayerDropdown()
+    notify("Player list refreshed.")
+end)
+
+Button(PlayerGroup, "Teleport To Player", "Go to the selected player", function()
+    local name = opt("PlayerList")
+    local target = name and Players:FindFirstChild(name)
+    local targetRoot = target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+    if not targetRoot then return notify("That player has no character right now.") end
+    pushPosition()
+    pivotTo(targetRoot.CFrame * CFrame.new(0, 0, 4))
+    notify("Teleported to " .. name)
+end)
+
+Button(PlayerGroup, "< Return", "Go back to your previous position", function()
+    if popPosition() then
+        notify("Returned to previous position")
+    else
+        notify("No saved position to return to.")
+    end
+end)
+
+local spectateButton
+
+spectateButton = ToggleButton(PlayerGroup, "Spectate Player",
+    "Point the camera at the selected player — press again to return the camera",
+    function()
+        local name = opt("PlayerList")
+        local target = name and Players:FindFirstChild(name)
+        local hum = target and target.Character and target.Character:FindFirstChildOfClass("Humanoid")
+        local camera = Workspace.CurrentCamera
+        if not hum or not camera then
+            notify("That player has no character right now.")
+            return false
+        end
+        camera.CameraSubject = hum
+        notify("Spectating " .. name .. " — press the button again to return.")
+    end,
+    function()
+        local hum = Char.humanoid()
+        local camera = Workspace.CurrentCamera
+        if hum and camera then camera.CameraSubject = hum end
+        notify("Camera returned.")
+    end)
+
+Button(PlayerGroup, "Stop Spectating", nil, function()
+    local hum = Char.humanoid()
+    local camera = Workspace.CurrentCamera
+    if hum and camera then
+        camera.CameraSubject = hum
+        notify("Camera returned.")
+    end
+    spectateButton:Set(false)
+end)
+
+Master:Add(Players.PlayerAdded:Connect(refreshPlayerDropdown))
+Master:Add(Players.PlayerRemoving:Connect(function()
+    task.defer(refreshPlayerDropdown)
+end))
+
+local serverLabel = ServerGroup:AddLabel("Players: --")
+
+do
+    local accumulator = 0
+    Master:Add(RunService.Heartbeat:Connect(function(dt)
+        accumulator += dt
+        if accumulator < 2 then return end
+        accumulator = 0
+        setLabel(serverLabel, ("Players: %d / %d"):format(#Players:GetPlayers(), Players.MaxPlayers))
+    end))
+end
+
+Button(ServerGroup, "Copy Job ID", nil, function()
+    if Exec.clipboard(tostring(game.JobId)) then
+        notify("Job ID copied.")
+    else
+        notify("Job ID: " .. tostring(game.JobId), 8)
+    end
+end)
+
+Button(ServerGroup, "Copy Join Script", "Copies a TeleportToPlaceInstance snippet for this server", function()
+    local snippet = ("game:GetService('TeleportService'):TeleportToPlaceInstance(%d, '%s', game:GetService('Players').LocalPlayer)")
+        :format(game.PlaceId, tostring(game.JobId))
+    if Exec.clipboard(snippet) then
+        notify("Join script copied.")
+    else
+        notify("Clipboard unsupported.")
+    end
+end)
+
+Button(ServerGroup, "Rejoin", nil, function()
+    notify("Rejoining...", 3)
+    task.wait(0.5)
+    TeleportService:Teleport(game.PlaceId, LocalPlayer)
+end)
+
+Button(ServerGroup, "Server Hop", "Finds another public server and joins it", function()
+    notify("Looking for a server...", 4)
+    local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100"):format(game.PlaceId)
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if not ok then return notify("Could not reach the Roblox server list.") end
+
+    local decoded
+    ok, decoded = pcall(function() return HttpService:JSONDecode(body) end)
+    if not ok or typeof(decoded) ~= "table" or typeof(decoded.data) ~= "table" then
+        return notify("Server list response was unreadable.")
+    end
+
+    local candidates = {}
+    for _, server in ipairs(decoded.data) do
+        if server.id ~= game.JobId and server.playing and server.maxPlayers
+            and server.playing < server.maxPlayers then
+            table.insert(candidates, server.id)
+        end
+    end
+
+    if #candidates == 0 then return notify("No other servers with space right now.") end
+    local pick = candidates[math.random(1, #candidates)]
+    notify("Hopping...", 4)
+    TeleportService:TeleportToPlaceInstance(game.PlaceId, pick, LocalPlayer)
+end)
+
+local threatLabel = WatchGroup:AddLabel("Nearest threat: --")
+
+Toggle(WatchGroup, "ThreatWarning", {
+    Text = "Proximity Warning",
+    Default = false,
+    Tooltip = "Notifies when a tracked threat gets close (needs matching ESP category on)",
+})
+
+WatchGroup:AddSlider("ThreatRange", {
+    Text = "Warning range",
+    Default = 40,
+    Min = 10,
+    Max = 200,
+    Rounding = 0,
+    Suffix = " studs",
+})
+
+do
+    local accumulator, lastWarn = 0, 0
+    Master:Add(RunService.Heartbeat:Connect(function(dt)
+        accumulator += dt
+        if accumulator < CONFIG.THREAT_INTERVAL then return end
+        accumulator = 0
+
+        if nearestThreat.name then
+            setLabel(threatLabel, ("Nearest threat: %s (%dm)"):format(nearestThreat.name, math.floor(nearestThreat.distance)))
+            if tog("ThreatWarning") and nearestThreat.distance <= opt("ThreatRange", 40) then
+                if tick() - lastWarn > 4 then
+                    lastWarn = tick()
+                    notify(("%s is %dm away!"):format(nearestThreat.name, math.floor(nearestThreat.distance)), 3)
+                end
+            end
+        else
+            setLabel(threatLabel, "Nearest threat: none tracked")
+        end
+    end))
+end
+
+local WOODPILE_CF  = CFrame.new(-27.149, 8.7, -118.611)
+local FIREPLACE_CF = CFrame.new(-45.113, 7.84, -60.241)
+local GENERATOR_CF = CFrame.new(-76.039, 4.675, -133.78)
+
+local function woodPileDetector()
+    local pile = Workspace:FindFirstChild("WoodPile")
+    local detector = pile and pile:FindFirstChild("Detector")
+    if not detector then return nil end
+    detector.CanCollide = false
+    return detector:FindFirstChildOfClass("ClickDetector")
+end
+
+local function grabAt(destination, trigger, label)
+    local before = toolSnapshot()
+    local held = nil
+
+    local done = runAt(destination, function()
+        interact(trigger)
+    end, function()
+        held = newToolSince(before)
+        return held ~= nil
+    end)
+
+    if done then
+        notify(("%s picked up."):format(label))
+    else
+        notify(("%s did not register a pickup — check you are close enough."):format(label), 5)
+    end
+    return done, held
+end
+
+Button(N1ActGroup, "Grab Wood", "Teleports to the pile and returns the instant the log is in hand", function()
+    local click = woodPileDetector()
+    if not click then return notify("Wood pile not found.") end
+    pushPosition()
+    grabAt(WOODPILE_CF, click, "Wood")
+end)
+
+Button(N1ActGroup, "Refill Fireplace", "Grabs wood, delivers it, returns the instant it is consumed", function()
+    local click = woodPileDetector()
+    if not click then return notify("Wood pile not found.") end
+
+    local char, root = Char.require()
+    local origin = root.CFrame
+    local before = toolSnapshot()
+    pushPosition()
+    Collision.acquire("fireplace")
+
+    local delivered = false
+    local ok, err = pcall(function()
+        char:PivotTo(WOODPILE_CF)
+        zeroVelocity(root)
+
+        local log
+        local grabbed = actUntil(function()
+            interact(click)
+        end, function()
+            log = newToolSince(before)
+            return log ~= nil
+        end)
+
+        if not grabbed then return end
+
+        char:PivotTo(FIREPLACE_CF)
+        zeroVelocity(root)
+
+        delivered = actUntil(function()
+            local fireplace = Workspace:FindFirstChild("Fireplace")
+            if fireplace then interact(fireplace) end
+        end, function()
+            return toolGone(log)
+        end)
+    end)
+
+    char:PivotTo(origin)
+    zeroVelocity(root)
+    Collision.release("fireplace")
+
+    if not ok then error(err, 0) end
+    notify(delivered and "Fireplace refilled." or "Wood was not consumed — you may already be full.", 5)
+end)
+
+Button(N1ActGroup, "Grab JerryCan", "Returns the instant the can is in hand", function()
+    local shack = Workspace:FindFirstChild("Shack")
+    local can = shack and shack:FindFirstChild("JerryCan")
+    local click = can and can:FindFirstChildOfClass("ClickDetector")
+    if not click then return notify("JerryCan not found.") end
+    pushPosition()
+    grabAt(GENERATOR_CF, click, "JerryCan")
+end)
+
+Button(N1ActGroup, "Refill Generator", "Grabs the can, fuels the generator, returns on completion", function()
+    local shack = Workspace:FindFirstChild("Shack")
+    if not shack then return notify("Shack not found.") end
+    local can = shack:FindFirstChild("JerryCan")
+    local gen = shack:FindFirstChild("Generator")
+    local canClick = can and can:FindFirstChildOfClass("ClickDetector")
+    local genClick = gen and gen:FindFirstChildOfClass("ClickDetector")
+    if not (canClick and genClick) then return notify("Generator or can not found.") end
+
+    local before = toolSnapshot()
+    pushPosition()
+
+    local fuelled = false
+    local stage = 1
+    local fuel
+
+    runAt(GENERATOR_CF, function()
+        if stage == 1 then
+            Exec.clickDetector(canClick)
+            fuel = newToolSince(before)
+            if fuel then stage = 2 end
+        else
+            Exec.clickDetector(genClick)
+        end
+    end, function()
+        if stage == 1 then return false end
+        fuelled = toolGone(fuel)
+        return fuelled
+    end)
+
+    notify(fuelled and "Generator refilled." or "Could not confirm the refill — try again closer.", 5)
+end)
+
+Toggle(N1ActGroup, "AutoFireplace", {
+    Text = "Auto Fireplace",
+    Default = false,
+    Tooltip = "Keeps the fireplace topped up on a timer",
+    Callback = function(state)
+        if not state then return end
+        spawnSafe(function()
+            while tog("AutoFireplace") do
+                local click = woodPileDetector()
+                if click then
+                    local char, root = Char.require()
+                    local origin = root.CFrame
+                    local before = toolSnapshot()
+                    Collision.acquire("autoFire")
+                    pcall(function()
+                        char:PivotTo(WOODPILE_CF)
+                        zeroVelocity(root)
+
+                        local log
+                        local grabbed = actUntil(function()
+                            interact(click)
+                        end, function()
+                            log = newToolSince(before)
+                            return log ~= nil
+                        end, 3)
+
+                        if grabbed then
+                            char:PivotTo(FIREPLACE_CF)
+                            zeroVelocity(root)
+                            actUntil(function()
+                                local fireplace = Workspace:FindFirstChild("Fireplace")
+                                if fireplace then interact(fireplace) end
+                            end, function()
+                                return toolGone(log)
+                            end, 3)
+                        end
+                    end)
+                    char:PivotTo(origin)
+                    zeroVelocity(root)
+                    Collision.release("autoFire")
+                end
+                task.wait(opt("AutoFireplaceDelay", 45))
+            end
+        end, "Auto fireplace")
+    end,
+})
+
+N1ActGroup:AddSlider("AutoFireplaceDelay", {
+    Text = "Fireplace interval",
+    Default = 45,
+    Min = 10,
+    Max = 180,
+    Rounding = 0,
+    Suffix = "s",
+})
+
+local upgradeFrameState
+
+ToggleButton(N1ActGroup, "Open Upgrade Frame",
+    "Press again to close it again",
+    function()
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        local dialogue = gui and gui:FindFirstChild("DialogueUI")
+        local frame = dialogue and dialogue:FindFirstChild("UpgradeFrame")
+        if not frame then
+            notify("UpgradeFrame not found.")
+            return false
+        end
+        upgradeFrameState = { inst = frame, visible = frame.Visible, position = frame.Position }
+        frame.Visible = true
+        frame.Position = UDim2.new(0.499, 0, 0.5, 0)
+        notify("Upgrade frame opened.")
+    end,
+    function()
+        local saved = upgradeFrameState
+        upgradeFrameState = nil
+        if saved and saved.inst.Parent then
+            pcall(function()
+                saved.inst.Visible = saved.visible
+                saved.inst.Position = saved.position
+            end)
+        end
+        notify("Upgrade frame closed.")
+    end)
+
+local gamblerCupColors = {}
+
+ToggleButton(N1ActGroup, "Mark Gambler Cups",
+    "Colours the cups so the shell game is readable — press again to restore their colours",
+    function()
+        local assets = ReplicatedStorage:FindFirstChild("Assets")
+        local gambler = (assets and assets:FindFirstChild("Gambler")) or Workspace:FindFirstChild("Gambler")
+        local cups = gambler and gambler:FindFirstChild("Cups")
+        if not cups then
+            notify("Gambler cups not found.")
+            return false
+        end
+
+        local one, three = cups:FindFirstChild("1"), cups:FindFirstChild("3")
+        if one then
+            table.insert(gamblerCupColors, { inst = one, color = one.BrickColor })
+            one.BrickColor = BrickColor.new("Really red")
+        end
+        if three then
+            table.insert(gamblerCupColors, { inst = three, color = three.BrickColor })
+            three.BrickColor = BrickColor.new("Lime green")
+        end
+        notify("Cups marked.")
+    end,
+    function()
+        for _, entry in ipairs(gamblerCupColors) do
+            if entry.inst.Parent then
+                pcall(function() entry.inst.BrickColor = entry.color end)
+            end
+        end
+        gamblerCupColors = {}
+        notify("Cup colours restored.")
+    end)
+
+local cameraRoutineBusy = false
+local CAMERA_TARGETS = {
+    { cf = CFrame.new(-51.5, 18, -89),   lookBack = false },
+    { cf = CFrame.new(-14.75, 18, -120), lookBack = true },
+    { cf = CFrame.new(-18.75, 18, 27),   lookBack = false },
+}
+
+Button(N1ActGroup, "Fix All Cameras", "Visits each camera and clicks it", function()
+    if cameraRoutineBusy then
+        return notify("Camera routine already running.")
+    end
+    if not Exec.hasMouse then
+        notify("Warning: mousemoverel unsupported — cursor lock skipped.", 5)
+    end
+
+    cameraRoutineBusy = true
+    local routine = Janitor.new()
+    Collision.acquire("cameraRoutine")
+
+    local ok, err = pcall(function()
+        local _, root = Char.require()
+        local hum = Char.humanoid()
+        local origin = root.CFrame
+        local camera = Workspace.CurrentCamera
+
+        if Exec.hasMouse then
+            routine:Add(RunService.RenderStepped:Connect(function()
+                local viewport = camera.ViewportSize
+                local mouse = UserInputService:GetMouseLocation()
+                Exec.mouseMoveRel(
+                    (viewport.X / 2) - mouse.X,
+                    (viewport.Y / 2) - 125 - mouse.Y
+                )
+            end))
+        end
+
+        if hum then hum.PlatformStand = true end
+
+        local function frameCamera(position, lookBack)
+            local offset = lookBack and Vector3.new(0, 3, 10) or Vector3.new(0, 3, -10)
+            camera.CFrame = CFrame.lookAt(position + offset, position + Vector3.new(0, 2, 0))
+        end
+
+        local function glideTo(targetCF)
+            local start = root.Position
+            local finish = targetCF.Position
+            local duration = math.clamp((finish - start).Magnitude / 290, 0.05, 0.5)
+            local elapsed = 0
+
+            while elapsed < duration do
+                elapsed += RunService.RenderStepped:Wait()
+                local alpha = math.clamp(elapsed / duration, 0, 1)
+                root.CFrame = CFrame.new(start:Lerp(finish, alpha))
+                zeroVelocity(root)
+                frameCamera(root.Position, false)
+            end
+
+            root.CFrame = targetCF
+            zeroVelocity(root)
+        end
+
+        for _, target in ipairs(CAMERA_TARGETS) do
+            glideTo(target.cf)
+
+            local timer = 0
+            while timer < 0.08 do
+                timer += RunService.RenderStepped:Wait()
+                root.CFrame = target.cf
+                zeroVelocity(root)
+                frameCamera(root.Position, target.lookBack)
+
+                local mouse = UserInputService:GetMouseLocation()
+                VirtualInputManager:SendMouseButtonEvent(mouse.X, mouse.Y, 0, true, game, 0)
+                task.wait(0.005)
+                VirtualInputManager:SendMouseButtonEvent(mouse.X, mouse.Y, 0, false, game, 0)
+                task.wait(0.01)
+            end
+
+            if target.lookBack then
+                frameCamera(root.Position, false)
+            end
+        end
+
+        if hum then hum.PlatformStand = false end
+        root.CFrame = origin
+        zeroVelocity(root)
+    end)
+
+    routine:Clean()
+    Collision.release("cameraRoutine")
+
+    local hum = Char.humanoid()
+    if hum then hum.PlatformStand = false end
+
+    cameraRoutineBusy = false
+    if not ok then error(err, 0) end
+    notify("All cameras fixed.")
+end)
+
+local grantedTablet
+
+ToggleButton(N2ActGroup, "Give Tablet",
+    "Press again to take the tablet back off you",
+    function()
+        local items = ReplicatedStorage:FindFirstChild("Items")
+        local tablet = items and items:FindFirstChild("Tablet")
+        if not tablet then
+            notify("Tablet asset not found.")
+            return false
+        end
+        local char = Char.require()
+        grantedTablet = tablet:Clone()
+        grantedTablet.Parent = char
+        notify("Tablet granted.")
+    end,
+    function()
+        if grantedTablet then
+            pcall(function() grantedTablet:Destroy() end)
+        end
+        grantedTablet = nil
+        notify("Tablet removed.")
+    end)
+
+Button(N2ActGroup, "Refill Power", "Collects the power cell and loads the generator", function()
+    local cell = Workspace:FindFirstChild("PowerCell")
+    local gen = Workspace:FindFirstChild("Generator")
+    local cellClick = cell and cell:FindFirstChildWhichIsA("ClickDetector", true)
+    local genClick = gen and gen:FindFirstChildWhichIsA("ClickDetector", true)
+    if not (cellClick and genClick) then return notify("Power cell or generator not found.") end
+
+    local char, root = Char.require()
+    local origin = root.CFrame
+    local before = toolSnapshot()
+    pushPosition()
+    Collision.acquire("power")
+
+    local loaded = false
+    local ok, err = pcall(function()
+        char:PivotTo(CFrame.new(-318.60, 82.4, 97.89))
+        zeroVelocity(root)
+
+        local cellTool
+        local collected = actUntil(function()
+            Exec.clickDetector(cellClick)
+        end, function()
+            cellTool = newToolSince(before)
+            return cellTool ~= nil or not cellClick.Parent
+        end, 3)
+
+        if not collected then return end
+
+        char:PivotTo(CFrame.new(-271.36, 82.4, 112.97))
+        zeroVelocity(root)
+
+        loaded = actUntil(function()
+            Exec.clickDetector(genClick)
+        end, function()
+            if cellTool then return toolGone(cellTool) end
+            return not genClick.Parent
+        end, 3)
+    end)
+
+    char:PivotTo(origin)
+    zeroVelocity(root)
+    Collision.release("power")
+
+    if not ok then error(err, 0) end
+    notify(loaded and "Power refilled." or "Could not confirm the refill.", 5)
+end)
+
+local lookAtRemote
+
+ToggleButton(N2ActGroup, "Disable Stalker Gaze Damage",
+    "Detaches the LookAt remote — press again to put it back",
+    function()
+        local folder = remotes()
+        local lookAt = folder and folder:FindFirstChild("LookAt")
+        if not lookAt then
+            notify("LookAt remote not found (already removed?).")
+            return false
+        end
+        lookAtRemote = { inst = lookAt, parent = lookAt.Parent }
+        lookAt.Parent = nil
+        notify("Immune to Stalker gaze damage.")
+    end,
+    function()
+        local saved = lookAtRemote
+        lookAtRemote = nil
+        if saved and saved.parent and saved.parent.Parent then
+            pcall(function() saved.inst.Parent = saved.parent end)
+        end
+        notify("LookAt remote restored.")
+    end)
+
+local ventHitboxes = {}
+
+ToggleButton(N2ActGroup, "Anti Vent-Pest",
+    "Detaches vent grab hitboxes — press again to put them back",
+    function()
+        local grids = Workspace:FindFirstChild("Grids")
+        if not grids then
+            notify("Grids folder not found.")
+            return false
+        end
+        local removed = 0
+        for _, grid in ipairs(grids:GetChildren()) do
+            for _, child in ipairs(grid:GetDescendants()) do
+                if child:IsA("BasePart") and child.Name == "Hitbox" then
+                    table.insert(ventHitboxes, { inst = child, parent = child.Parent })
+                    child.Parent = nil
+                    removed += 1
+                end
+            end
+        end
+        notify(("Removed %d vent hitbox(es)."):format(removed))
+    end,
+    function()
+        local restored = 0
+        for _, entry in ipairs(ventHitboxes) do
+            if entry.parent and entry.parent.Parent then
+                if pcall(function() entry.inst.Parent = entry.parent end) then
+                    restored += 1
+                end
+            end
+        end
+        ventHitboxes = {}
+        notify(("Restored %d vent hitbox(es)."):format(restored))
+    end)
+
+Button(N2ActGroup, "Revive", nil, function()
+    if fireRemote("LoadCharacter") then notify("Revive requested.") end
+end)
+
+Button(N2ActGroup, "Escape Snatch", nil, function()
+    if fireRemote("EscapeSnatch") then notify("Escaped the snatch!") end
+end)
+
+Toggle(N2ActGroup, "AutoEscapeSnatch", {
+    Text = "Auto Escape Snatch",
+    Default = false,
+    Tooltip = "Spams EscapeSnatch whenever you stop being able to move",
+    Callback = function(state)
+        if not state then return end
+        spawnSafe(function()
+            while tog("AutoEscapeSnatch") do
+                local hum = Char.humanoid()
+                if hum and (hum.PlatformStand or hum.WalkSpeed == 0) then
+                    fireRemote("EscapeSnatch")
+                    task.wait(0.2)
+                end
+                task.wait(0.3)
+            end
+        end, "Auto escape")
+    end,
+})
+
+local BUNKER_FUEL_NAMES = { JerryCan = true, Gasoline = true, Fuel = true }
+local BUNKER_GEN_NAMES  = { Generator = true, Gen = true }
+local BUNKER_VENT_NAMES = { Ventilation = true, Vent = true, Debris = true }
+
+local FUEL_REMOTE_NAMES = { "Refuel", "FillGenerator", "UseFuel", "AddFuel", "FuelGenerator" }
+
+local function fireGenerators(generators, fuelTool)
+    local fired = false
+
+    for _, gen in ipairs(generators) do
+        if interact(gen) then fired = true end
+    end
+
+    if fuelTool and fuelTool.Parent then
+        pcall(function() fuelTool:Activate() end)
+        fired = true
+    end
+
+    local folder = remotes()
+    if folder then
+        for _, name in ipairs(FUEL_REMOTE_NAMES) do
+            local remote = folder:FindFirstChild(name)
+            if remote and remote:IsA("RemoteEvent") then
+                pcall(function() remote:FireServer() end)
+                fired = true
+            end
+        end
+    end
+
+    return fired
+end
+
+local function isCarried(inst)
+    if inst:FindFirstAncestorOfClass("Backpack") then return true end
+    local model = inst:FindFirstAncestorOfClass("Model")
+    while model do
+        if model:FindFirstChildOfClass("Humanoid") then return true end
+        model = model:FindFirstAncestorOfClass("Model")
+    end
+    return false
+end
+
+local function fuelInInventory()
+    local containers = { Char.get(), LocalPlayer:FindFirstChildOfClass("Backpack") }
+    for _, container in ipairs(containers) do
+        if container then
+            for _, item in ipairs(container:GetChildren()) do
+                if item:IsA("Tool") and BUNKER_FUEL_NAMES[item.Name] then return item end
+            end
+        end
+    end
+    return nil
+end
+
+local usedCans = setmetatable({}, { __mode = "k" })
+
+local function canCandidates()
+    local root = Char.root()
+    local origin = root and root.Position or Vector3.zero
+    local list = {}
+
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if BUNKER_FUEL_NAMES[inst.Name] and not usedCans[inst] and not isCarried(inst) then
+            local part = mainPartOf(inst)
+            if part then
+                table.insert(list, {
+                    inst = inst,
+                    part = part,
+                    distance = (part.Position - origin).Magnitude,
+                })
+            end
+        end
+    end
+
+    return list
+end
+
+local function pickCan()
+    local list = canCandidates()
+
+    if #list == 0 then
+        usedCans = setmetatable({}, { __mode = "k" })
+        list = canCandidates()
+    end
+    if #list == 0 then return nil end
+
+    if tog("RandomCan") then
+        return list[math.random(1, #list)]
+    end
+
+    table.sort(list, function(a, b) return a.distance < b.distance end)
+    return list[1]
+end
+
+local function findNamedGenerator()
+    local direct = Workspace:FindFirstChild("Generator")
+    if direct then return direct end
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst.Name == "Generator" and (inst:IsA("Model") or inst:IsA("BasePart")) then
+            return inst
+        end
+    end
+    return nil
+end
+
+local function generatorSpotCF(gen)
+    local part = mainPartOf(gen)
+    if not part then return nil, nil end
+    return CFrame.new(part.Position + Vector3.new(0, 3, 0)), part
+end
+
+local refillBusy = false
+
+local function refillGeneratorRoutine()
+    if refillBusy then
+        return false, "Refill already running."
+    end
+
+    local character, root = Char.require()
+    local generator = findNamedGenerator()
+    if not generator then
+        return false, "No object named 'Generator' found in Workspace."
+    end
+
+    local generatorCF, generatorPart = generatorSpotCF(generator)
+    if not generatorCF then
+        return false, ("Found %s but it contains no BasePart to stand on."):format(generator:GetFullName())
+    end
+
+    local origin = root.CFrame
+    local timeout = opt("RefillTimeout", 3)
+
+    refillBusy = true
+    Collision.acquire("refill")
+
+    local stage, detail = "start", nil
+
+    local tried = 0
+
+    local ok, err = pcall(function()
+        local fuel = fuelInInventory()
+
+        while not fuel and tried < opt("CanAttempts", 6) do
+            local candidate = pickCan()
+            if not candidate then
+                stage = "nocan"
+                return
+            end
+
+            tried += 1
+            usedCans[candidate.inst] = true
+
+            local canPosition = candidate.part.Position
+            local before = toolSnapshot()
+
+            character:PivotTo(CFrame.new(canPosition + Vector3.new(0, 3, 0)))
+            zeroVelocity(root)
+
+            actUntil(function()
+                local part = candidate.part
+                local livePosition = (part and part.Parent) and part.Position or canPosition
+                root.CFrame = CFrame.new(livePosition + Vector3.new(0, 3, 0))
+                zeroVelocity(root)
+                interact(candidate.inst)
+            end, function()
+                fuel = fuelInInventory() or newToolSince(before)
+                return fuel ~= nil
+            end, timeout)
+        end
+
+        if not fuel then
+            stage = "nopickup"
+            return
+        end
+
+        local humanoid = Char.humanoid()
+        if humanoid and fuel and fuel.Parent ~= character then
+            pcall(function() humanoid:EquipTool(fuel) end)
+            waitUntil(function() return fuel.Parent == character end, 1)
+        end
+
+        character:PivotTo(generatorCF)
+        zeroVelocity(root)
+
+        local emptied = actUntil(function()
+            root.CFrame = CFrame.new(generatorPart.Position + Vector3.new(0, 3, 0))
+            zeroVelocity(root)
+            fireGenerators({ generator }, fuelInInventory())
+        end, function()
+            return fuelInInventory() == nil
+        end, timeout)
+
+        stage = emptied and "done" or "notconsumed"
+        detail = ("%s at %d, %d, %d"):format(
+            generator:GetFullName(),
+            generatorPart.Position.X,
+            generatorPart.Position.Y,
+            generatorPart.Position.Z
+        )
+    end)
+
+    if root.Parent then
+        root.CFrame = origin
+        zeroVelocity(root)
+    end
+    Collision.release("refill")
+    refillBusy = false
+
+    if not ok then error(err, 0) end
+
+    if stage == "done" then
+        local left = #canCandidates()
+        return true, ("Generator refilled — %d can%s left in the map."):format(left, left == 1 and "" or "s")
+    elseif stage == "nocan" then
+        return false, "No JerryCan left in the map that I have not already taken."
+    elseif stage == "nopickup" then
+        return false, ("Visited %d can spot(s), none gave a pickup — they were probably already looted."):format(tried)
+    elseif stage == "notconsumed" then
+        return false, ("Reached %s but the can was never consumed."):format(detail or "the generator")
+    end
+    return false, "Refill did not complete."
+end
+
+Button(BunkerActGroup, "Refill Generator", "TP to a can, grab it, TP to the Generator, refill, return when the can is gone", function()
+    pushPosition()
+    local ok, message = refillGeneratorRoutine()
+    notify(message, ok and 4 or 6)
+end)
+
+BunkerActGroup:AddSlider("RefillTimeout", {
+    Text = "Per-step timeout",
+    Default = 3,
+    Min = 0.5,
+    Max = 10,
+    Rounding = 1,
+    Suffix = "s",
+    Tooltip = "How long each stage (pickup, refill) may take before giving up",
+})
+
+BunkerActGroup:AddSlider("CanAttempts", {
+    Text = "Cans to try per run",
+    Default = 6,
+    Min = 1,
+    Max = 12,
+    Rounding = 0,
+    Tooltip = "The Bunker has 6 cans, so 6 lets one run walk every spot before giving up",
+})
+
+Toggle(BunkerActGroup, "RandomCan", {
+    Text = "Random can order",
+    Default = false,
+    Tooltip = "Off: always walks to the nearest untried can. On: picks one at random",
+})
+
+Button(BunkerActGroup, "Forget Taken Cans", "Clears the memory of which cans were already collected", function()
+    usedCans = setmetatable({}, { __mode = "k" })
+    notify("Can memory cleared — every JerryCan is a target again.")
+end)
+
+Toggle(BunkerActGroup, "AutoBunkerFuel", {
+    Text = "Auto Refuel Generator",
+    Default = false,
+    Tooltip = "Repeats the refuel routine on a timer",
+    Callback = function(state)
+        if not state then return end
+        spawnSafe(function()
+            while tog("AutoBunkerFuel") do
+                pcall(refillGeneratorRoutine)
+                task.wait(opt("AutoFuelDelay", 60))
+            end
+        end, "Auto refuel")
+    end,
+})
+
+BunkerActGroup:AddSlider("AutoFuelDelay", {
+    Text = "Refuel interval",
+    Default = 60,
+    Min = 15,
+    Max = 240,
+    Rounding = 0,
+    Suffix = "s",
+})
+
+local function findVents()
+    local vents = {}
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if BUNKER_VENT_NAMES[inst.Name] then
+            table.insert(vents, inst)
+        end
+    end
+    return vents
+end
+
+Button(BunkerActGroup, "Fix Ventilation", "Teleports to the vent and snaps back the frame it is fixed", function()
+    local vents = findVents()
+    if #vents == 0 then
+        return notify("No ventilation object found — nothing to fix.")
+    end
+
+    local triggers = {}
+    for _, vent in ipairs(vents) do
+        for _, trigger in ipairs(collectTriggers(vent)) do
+            table.insert(triggers, trigger)
+        end
+    end
+
+    if #triggers == 0 then
+        return notify("Vent found but it has no prompt or click detector to fire.")
+    end
+
+    local startingLive = triggersLive(triggers)
+    if startingLive == 0 then
+        return notify("Ventilation is already fixed.")
+    end
+
+    pushPosition()
+
+    local fixed, attempts = runAt(BUNKER_SPOTS[3].cf, function()
+        for _, trigger in ipairs(triggers) do
+            interact(trigger)
+        end
+    end, function()
+        for _, vent in ipairs(vents) do
+            if vent.Parent then
+                return triggersLive(triggers) == 0
+            end
+        end
+        return true
+    end, opt("VentTimeout", 6))
+
+    if fixed then
+        notify(("Ventilation fixed in %d attempt(s) — returned instantly."):format(attempts))
+    else
+        notify(("Vent still has %d live trigger(s) after %ds — returned anyway.")
+            :format(triggersLive(triggers), opt("VentTimeout", 6)), 6)
+    end
+end)
+
+BunkerActGroup:AddSlider("VentTimeout", {
+    Text = "Vent give-up time",
+    Default = 6,
+    Min = 1,
+    Max = 20,
+    Rounding = 0,
+    Suffix = "s",
+})
+
+Button(BunkerActGroup, "Collect Nearby Items", "Fires every prompt and click detector within range", function()
+    local root = Char.root()
+    if not root then return notify("Character not ready.") end
+    local range = opt("PromptRange", 18)
+    local count = 0
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("ProximityPrompt") or inst:IsA("ClickDetector") then
+            local parent = inst.Parent
+            local pos = parent and worldPosition(parent)
+            if pos and (pos - root.Position).Magnitude <= range then
+                if interact(inst) then count += 1 end
+            end
+        end
+    end
+    notify(("Fired %d interaction(s)."):format(count))
+end)
+
+-- Night 3 --------------------------------------------------------------------
+-- Anything added to NIGHT3_SPOTS above turns into a teleport button in the
+-- Teleports box. To add your own to the Actions box:
+--   Button(ActGroup, "Text", "tooltip", function() ... end)
+--   ToggleButton(ActGroup, "Text", "tooltip", applyFn, revertFn)
+--   Toggle(ActGroup, "UniqueId", { Text = "Text", Default = false, Callback = fn })
+-- Wrapped in a do block so its locals do not count against the main chunk.
+do
+    local TPGroup  = Tabs.Night3:AddLeftGroupbox("Teleports")
+    local ActGroup = Tabs.Night3:AddRightGroupbox("Actions")
+
+    buildTeleports(TPGroup, NIGHT3_SPOTS)
+
+    local AMMO_PILES     = { LeftAmmoPile = true, RightAmmoPile = true }
+    local EXCLUDED_ROOTS = { Cabins = true }
+
+    local function underExcludedRoot(inst)
+        local parent = inst.Parent
+        while parent and parent ~= Workspace do
+            if EXCLUDED_ROOTS[parent.Name] then return true end
+            parent = parent.Parent
+        end
+        return false
+    end
+
+    -- A spawn point that has nothing on it still holds an invisible placeholder,
+    -- which is how the can teleport kept sending you to empty spots. Something
+    -- actually spawned has at least one part you can see.
+    local function isVisible(inst)
+        if inst:IsA("BasePart") then return inst.Transparency < 1 end
+        for _, part in ipairs(inst:GetDescendants()) do
+            if part:IsA("BasePart") and part.Transparency < 1 then return true end
+        end
+        return false
+    end
+
+    -- Ammo only ever spawns inside the two piles, so the search starts from them
+    -- rather than from every "Shells" in the map. The ones under Workspace.Cabins
+    -- are scenery and are never reachable this way.
+    local function ammoSpots()
+        local piles, found = 0, {}
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            if AMMO_PILES[inst.Name] then
+                piles += 1
+                for _, child in ipairs(inst:GetDescendants()) do
+                    if child.Name == "Shells" and not isCarried(child) then
+                        local pos = worldPosition(child)
+                        if pos then
+                            table.insert(found, { pos = pos, path = child:GetFullName() })
+                        end
+                    end
+                end
+            end
+        end
+        return found, piles
+    end
+
+    local function canSpots()
+        local found = {}
+        for _, inst in ipairs(Workspace:GetDescendants()) do
+            if inst.Name == "JerryCan" and not isCarried(inst) and not underExcludedRoot(inst) then
+                local pos = worldPosition(inst)
+                if pos and isVisible(inst) then
+                    table.insert(found, { pos = pos, path = inst:GetFullName() })
+                end
+            end
+        end
+        return found
+    end
+
+    -- Lands you just above the target, keeping your facing, and pushes the old
+    -- spot so "< Return" works. The path goes to the console so a wrong target
+    -- can be identified by name.
+    local function goTo(spot)
+        local _, root = Char.require()
+        warn("[Sulfoxium Hub] teleport target: " .. spot.path)
+        pushPosition()
+        pivotTo(CFrame.new(spot.pos + Vector3.new(0, 3, 0)) * root.CFrame.Rotation)
+    end
+
+    Button(ActGroup, "TP To Random Ammo", "Picks a random 'Shells' out of LeftAmmoPile / RightAmmoPile", function()
+        local found, piles = ammoSpots()
+
+        if piles == 0 then
+            return notify("No LeftAmmoPile or RightAmmoPile in this map.", 6)
+        end
+        if #found == 0 then
+            return notify(("Found %d ammo pile(s) but no Shells in them right now."):format(piles), 6)
+        end
+
+        goTo(found[math.random(1, #found)])
+        notify(("Teleported to ammo — %d in the piles. '< Return' brings you back."):format(#found))
+    end)
+
+    Button(ActGroup, "TP To Nearest JerryCan", "Skips empty spawn points and anything under Cabins", function()
+        local _, root = Char.require()
+        local found = canSpots()
+        if #found == 0 then
+            return notify("No JerryCan has spawned right now.", 5)
+        end
+
+        local nearest, nearestDistance
+        for _, spot in ipairs(found) do
+            local distance = (spot.pos - root.Position).Magnitude
+            if not nearestDistance or distance < nearestDistance then
+                nearest, nearestDistance = spot, distance
+            end
+        end
+
+        goTo(nearest)
+        notify(("Teleported to a JerryCan %dm away — %d spawned. '< Return' brings you back.")
+            :format(math.floor(nearestDistance), #found))
+    end)
+
+    local SAFE_SPOT = Vector3.new(194.70, 38.70, -215.17)
+
+    Button(ActGroup, "Teleport To Safe Spot", "Teleports you to 194.70, 38.70, -215.17", function()
+        local _, root = Char.require()
+        pushPosition()
+        pivotTo(CFrame.new(SAFE_SPOT) * root.CFrame.Rotation)
+        notify("Teleported to the safe spot. '< Return' brings you back.")
+    end)
+
+    local function findDepthEffect()
+        for _, inst in ipairs(Lighting:GetDescendants()) do
+            if inst:IsA("DepthOfFieldEffect") or inst.Name:lower():find("depth", 1, true) then
+                return inst
+            end
+        end
+        return nil
+    end
+
+    local depthState
+
+    -- Zeroing the far intensity kills the blur while leaving the effect in
+    -- place, so nothing the cutscenes drive goes missing. The value is held
+    -- because the game sets it as you play, and the original comes back on the
+    -- second press.
+    ToggleButton(ActGroup, "No Blur",
+        "Sets the DepthOfField FarIntensity to 0 — press again to put it back",
+        function()
+            local effect = findDepthEffect()
+            if not effect then
+                notify("No DepthOfField effect found in Lighting.", 5)
+                return false
+            end
+
+            depthState = { inst = effect, far = effect.FarIntensity }
+            effect.FarIntensity = 0
+
+            Master:Add(RunService.Heartbeat:Connect(function()
+                if effect.Parent and effect.FarIntensity ~= 0 then
+                    effect.FarIntensity = 0
+                end
+            end), "noBlur")
+
+            warn(("[Sulfoxium Hub] holding %s FarIntensity at 0 (was %.3f)")
+                :format(effect:GetFullName(), depthState.far))
+            notify("Blur off — FarIntensity held at 0.")
+        end,
+        function()
+            Master:Remove("noBlur")
+            if depthState and depthState.inst.Parent then
+                pcall(function() depthState.inst.FarIntensity = depthState.far end)
+            end
+            depthState = nil
+            notify("FarIntensity restored.")
+        end)
+
+    -- Matched by class as well as name, so a renamed one is still found.
+    local function isAtmosphere(inst)
+        return inst:IsA("Atmosphere") or inst.Name == "Atmosphere"
+    end
+
+    Button(ActGroup, "Remove All Blurs", "Removes the Atmosphere from Lighting — nothing else is touched", function()
+        local removed = 0
+
+        for _, inst in ipairs(Lighting:GetDescendants()) do
+            if isAtmosphere(inst) then
+                warn(("[Sulfoxium Hub] removing %s (%s)"):format(inst:GetFullName(), inst.ClassName))
+                if pcall(function() inst:Destroy() end) then removed += 1 end
+            end
+        end
+
+        notify(removed > 0
+            and ("Removed %d Atmosphere."):format(removed)
+            or "No Atmosphere found in Lighting.", 5)
+    end)
+
+    -- Same machinery as the Visuals ESP toggles, just living in this tab.
+    for _, cat in ipairs(ESP_CATEGORIES) do
+        if cat.tab == "Night3" then
+            buildEspToggle(ActGroup, cat)
+        end
+    end
+end
+
+local MenuGroup  = Tabs.Settings:AddLeftGroupbox("Menu")
+local PanicGroup = Tabs.Settings:AddRightGroupbox("Panic")
+
+-- Rayfield opens and closes itself on the keybind given to CreateWindow, and it
+-- has no watermark or keybind list, so those three controls have no equivalent.
+MenuGroup:AddLabel("Menu bind: Left Control")
+
+local panicked = false
+
+local function panic(reason)
+    if panicked then return end
+
+    -- Nothing may unload the menu while it is still being built. A stray call
+    -- during startup is what tore the UI down a moment after it appeared.
+    if not uiReady then
+        warn("[Sulfoxium Hub] ignored an unload during startup: " .. tostring(reason))
+        return
+    end
+
+    panicked = true
+
+    local keep = { AutoReapply = true, AntiAFK = true }
+    eachToggle(function(name, toggle)
+        if toggle.Value == true and not keep[name] then
+            pcall(function() toggle:SetValue(false) end)
+        end
+    end)
+
+    pcall(revertToggleButtons)
+
+    Collision.releaseAll()
+
+    local char = Char.get()
+    if char then
+        local hum = Char.humanoid()
+        if hum then
+            hum.WalkSpeed = baseWalkSpeed
+            hum.JumpPower = baseJumpPower
+            hum.PlatformStand = false
+        end
+        char:SetAttribute("SprintSpeed", CONFIG.DEFAULT_SPRINT_SPEED)
+    end
+
+    restoreLighting()
+
+    local camera = Workspace.CurrentCamera
+    if camera then
+        local hum = Char.humanoid()
+        if hum then camera.CameraSubject = hum end
+    end
+    LocalPlayer.CameraMinZoomDistance = CameraState.defaultMin
+    LocalPlayer.CameraMaxZoomDistance = CameraState.defaultMax
+
+    ESP.running = false
+    for inst in pairs(ESP.active) do
+        removeEspEntry(inst)
+    end
+
+    Master:Clean()
+
+    for _, container in ipairs({ hiddenUI, CoreGui }) do
+        for _, obj in ipairs(container:GetChildren()) do
+            if obj.Name == "RMx_ESP" or obj.Name == "RMx_ESPLabel"
+                or obj.Name == "Sulfoxium Hub" or obj.Name == "TheBunkerHelper" then
+                pcall(function() obj:Destroy() end)
+            end
+        end
+    end
+
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("Highlight") and (obj.Name == "RMx_ESP" or obj.Name == "ESPHighlight" or obj.Name == "AbomHighlight") then
+            pcall(function() obj:Destroy() end)
+        end
+    end
+
+    pcall(function() Rayfield:Destroy() end)
+    warn("[Sulfoxium Hub] Unloaded (" .. tostring(reason) .. ")")
+end
+
+Button(MenuGroup, "Unload", "Reverts everything and closes the menu", function()
+    panic("unload button")
+end)
+
+Button(PanicGroup, "PANIC — Unload Everything", "Reverts all changes and closes the menu", function()
+    panic("panic button")
+end)
+
+Button(PanicGroup, "Soft Reset", "Turns every toggle and toggled button off but keeps the menu open", function()
+    local keep = { AutoReapply = true, AntiAFK = true }
+    eachToggle(function(name, toggle)
+        if toggle.Value == true and not keep[name] then
+            pcall(function() toggle:SetValue(false) end)
+        end
+    end)
+    pcall(revertToggleButtons)
+    Collision.releaseAll()
+    notify("All features reset.")
+end)
+
+PanicGroup:AddLabel("Panic bind: End")
+
+KEYBINDS.End = function() panic("panic keybind") end
+
+Master:Add(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    local action = KEYBINDS[input.KeyCode.Name]
+    if action then action() end
+end))
+
+refreshWaypointDropdown()
+refreshPlayerDropdown()
+
+pcall(function() Rayfield:LoadConfiguration() end)
+
+-- Only now may anything unload the menu.
+uiReady = true
+
+notify(("Sulfoxium Hub loaded — %s"):format(SUPPORTED_PLACES[game.PlaceId]), 8)
