@@ -185,14 +185,28 @@ local Master = Janitor.new()
 local Rayfield
 
 local function notify(text, duration)
-    if not Rayfield then return end
-    pcall(function()
+    text = tostring(text)
+
+    -- Falls back to the console rather than vanishing: before Rayfield has
+    -- loaded there is nothing to draw on, and a notification that fails should
+    -- still leave a trace.
+    if not Rayfield or not Rayfield.Notify then
+        warn("[Sulfoxium Hub] " .. text)
+        return
+    end
+
+    local ok, err = pcall(function()
         Rayfield:Notify({
             Title = "Sulfoxium Hub",
-            Content = tostring(text),
+            Content = text,
             Duration = duration or CONFIG.NOTIFY_TIME,
+            Image = 4483362458,
         })
     end)
+
+    if not ok then
+        warn(("[Sulfoxium Hub] %s (notification failed: %s)"):format(text, tostring(err)))
+    end
 end
 
 local function safe(fn, label)
@@ -2347,6 +2361,35 @@ Button(ESPGroup, "Clear All ESP", "Disables every ESP category", function()
     notify("ESP cleared.")
 end)
 
+-- Atmosphere and Sky have no Enabled property, so reading or writing it throws.
+-- Only PostEffect subclasses (blur, colour correction, bloom, sun rays, depth of
+-- field) can be switched off in place; those two get detached and put back.
+local Effects = { detached = {} }
+
+function Effects.detach(inst)
+    if not inst.Parent then return end
+    table.insert(Effects.detached, { inst = inst, parent = inst.Parent })
+    inst.Parent = nil
+end
+
+function Effects.restore()
+    for _, entry in ipairs(Effects.detached) do
+        pcall(function() entry.inst.Parent = entry.parent end)
+    end
+    Effects.detached = {}
+end
+
+function Effects.kill(inst, enabledStore)
+    if inst:IsA("PostEffect") then
+        if enabledStore and enabledStore[inst] == nil then
+            enabledStore[inst] = inst.Enabled
+        end
+        if inst.Enabled then inst.Enabled = false end
+    elseif inst:IsA("Atmosphere") or inst:IsA("Sky") then
+        Effects.detach(inst)
+    end
+end
+
 local LightingState = { snapshot = nil, effectStates = nil }
 
 local LIGHTING_PROPS = {
@@ -2366,8 +2409,7 @@ local function snapshotLighting()
 
     local states = {}
     for _, child in ipairs(Lighting:GetChildren()) do
-        if child:IsA("BlurEffect") or child:IsA("Atmosphere") or child:IsA("Sky")
-            or child:IsA("ColorCorrectionEffect") then
+        if child:IsA("PostEffect") then
             states[child] = child.Enabled
         end
     end
@@ -2376,12 +2418,7 @@ end
 
 local function suppressEffects()
     for _, child in ipairs(Lighting:GetChildren()) do
-        if child:IsA("BlurEffect") or child:IsA("Atmosphere") or child:IsA("Sky") then
-            if LightingState.effectStates and LightingState.effectStates[child] == nil then
-                LightingState.effectStates[child] = child.Enabled
-            end
-            child.Enabled = false
-        end
+        Effects.kill(child, LightingState.effectStates)
     end
     local gui = LocalPlayer:FindFirstChild("PlayerGui")
     if gui then
@@ -2415,10 +2452,7 @@ end
 
 local function pureKillEffect(inst)
     if not isPureEffect(inst) then return end
-    if Pure.effects[inst] == nil then
-        Pure.effects[inst] = inst.Enabled
-    end
-    if inst.Enabled then inst.Enabled = false end
+    Effects.kill(inst, Pure.effects)
 end
 
 local function pureStripShadows(inst)
@@ -2511,6 +2545,8 @@ function Pure.disable()
     Master:Remove("pureLighting")
     Master:Remove("pureHold")
 
+    Effects.restore()
+
     for inst, wasEnabled in pairs(Pure.effects) do
         if typeof(inst) == "Instance" and inst.Parent then
             pcall(function() inst.Enabled = wasEnabled end)
@@ -2558,6 +2594,7 @@ end
 
 local function restoreLighting()
     Pure.disable()
+    Effects.restore()
     if not LightingState.snapshot then return end
     for prop, value in pairs(LightingState.snapshot) do
         pcall(function() Lighting[prop] = value end)
@@ -2592,11 +2629,8 @@ Toggle(LightingGroup, "Fullbright", {
             Master:Add(Lighting.ChildAdded:Connect(function(child)
                 if not tog("Fullbright") then return end
                 task.defer(function()
-                    if child:IsA("BlurEffect") or child:IsA("Atmosphere") or child:IsA("Sky") then
-                        if LightingState.effectStates then
-                            LightingState.effectStates[child] = child.Enabled
-                        end
-                        child.Enabled = false
+                    if child.Parent then
+                        Effects.kill(child, LightingState.effectStates)
                     end
                 end)
             end), "fbChildAdded")
