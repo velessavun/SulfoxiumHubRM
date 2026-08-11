@@ -2416,289 +2416,295 @@ Button(ESPGroup, "Clear All ESP", "Disables every ESP category", function()
     notify("ESP cleared.")
 end)
 
--- Atmosphere and Sky have no Enabled property, so reading or writing it throws.
--- Only PostEffect subclasses (blur, colour correction, bloom, sun rays, depth of
--- field) can be switched off in place; those two get detached and put back.
-local Effects = { detached = {} }
+-- Scoped so its locals are released at the end of the block: the main chunk
+-- is close to Luau's 200 simultaneous locals and this section holds fifteen.
+local restoreLighting
 
-function Effects.detach(inst)
-    if not inst.Parent then return end
-    table.insert(Effects.detached, { inst = inst, parent = inst.Parent })
-    inst.Parent = nil
-end
+do
+    -- Atmosphere and Sky have no Enabled property, so reading or writing it throws.
+    -- Only PostEffect subclasses (blur, colour correction, bloom, sun rays, depth of
+    -- field) can be switched off in place; those two get detached and put back.
+    local Effects = { detached = {} }
 
-function Effects.restore()
-    for _, entry in ipairs(Effects.detached) do
-        pcall(function() entry.inst.Parent = entry.parent end)
+    function Effects.detach(inst)
+        if not inst.Parent then return end
+        table.insert(Effects.detached, { inst = inst, parent = inst.Parent })
+        inst.Parent = nil
     end
-    Effects.detached = {}
-end
 
-function Effects.kill(inst, enabledStore)
-    if inst:IsA("PostEffect") then
-        if enabledStore and enabledStore[inst] == nil then
-            enabledStore[inst] = inst.Enabled
+    function Effects.restore()
+        for _, entry in ipairs(Effects.detached) do
+            pcall(function() entry.inst.Parent = entry.parent end)
         end
-        if inst.Enabled then inst.Enabled = false end
-    elseif inst:IsA("Atmosphere") or inst:IsA("Sky") then
-        Effects.detach(inst)
+        Effects.detached = {}
     end
-end
 
-local LightingState = { snapshot = nil, effectStates = nil }
-
-local LIGHTING_PROPS = {
-    "Brightness", "FogEnd", "FogStart", "GlobalShadows",
-    "Ambient", "OutdoorAmbient", "ShadowSoftness", "ExposureCompensation",
-}
-
-local function snapshotLighting()
-    if LightingState.snapshot then return end
-
-    local snap = {}
-    for _, prop in ipairs(LIGHTING_PROPS) do
-        local ok, value = pcall(function() return Lighting[prop] end)
-        if ok then snap[prop] = value end
-    end
-    LightingState.snapshot = snap
-
-    local states = {}
-    for _, child in ipairs(Lighting:GetChildren()) do
-        if child:IsA("PostEffect") then
-            states[child] = child.Enabled
+    function Effects.kill(inst, enabledStore)
+        if inst:IsA("PostEffect") then
+            if enabledStore and enabledStore[inst] == nil then
+                enabledStore[inst] = inst.Enabled
+            end
+            if inst.Enabled then inst.Enabled = false end
+        elseif inst:IsA("Atmosphere") or inst:IsA("Sky") then
+            Effects.detach(inst)
         end
     end
-    LightingState.effectStates = states
-end
 
-local function suppressEffects()
-    for _, child in ipairs(Lighting:GetChildren()) do
-        Effects.kill(child, LightingState.effectStates)
-    end
-    local gui = LocalPlayer:FindFirstChild("PlayerGui")
-    if gui then
-        for _, obj in ipairs(gui:GetDescendants()) do
-            if obj:IsA("BlurEffect") then obj.Enabled = false end
+    local LightingState = { snapshot = nil, effectStates = nil }
+
+    local LIGHTING_PROPS = {
+        "Brightness", "FogEnd", "FogStart", "GlobalShadows",
+        "Ambient", "OutdoorAmbient", "ShadowSoftness", "ExposureCompensation",
+    }
+
+    local function snapshotLighting()
+        if LightingState.snapshot then return end
+
+        local snap = {}
+        for _, prop in ipairs(LIGHTING_PROPS) do
+            local ok, value = pcall(function() return Lighting[prop] end)
+            if ok then snap[prop] = value end
         end
-    end
-end
+        LightingState.snapshot = snap
 
-local FULLBRIGHT_MAX = 6
-
-local PURE_EFFECT_CLASSES = {
-    "BlurEffect", "ColorCorrectionEffect", "SunRaysEffect", "BloomEffect",
-    "DepthOfFieldEffect", "Atmosphere", "Sky",
-}
-
-local Pure = {
-    active  = false,
-    effects = setmetatable({}, { __mode = "k" }),
-    parts   = setmetatable({}, { __mode = "k" }),
-    lights  = setmetatable({}, { __mode = "k" }),
-    props   = nil,
-}
-
-local function isPureEffect(inst)
-    for _, className in ipairs(PURE_EFFECT_CLASSES) do
-        if inst:IsA(className) then return true end
-    end
-    return false
-end
-
-local function pureKillEffect(inst)
-    if not isPureEffect(inst) then return end
-    Effects.kill(inst, Pure.effects)
-end
-
-local function pureStripShadows(inst)
-    if inst:IsA("BasePart") then
-        if Pure.parts[inst] == nil then
-            Pure.parts[inst] = inst.CastShadow
+        local states = {}
+        for _, child in ipairs(Lighting:GetChildren()) do
+            if child:IsA("PostEffect") then
+                states[child] = child.Enabled
+            end
         end
-        if inst.CastShadow then inst.CastShadow = false end
-    elseif inst:IsA("Light") then
-        if Pure.lights[inst] == nil then
-            Pure.lights[inst] = inst.Shadows
-        end
-        if inst.Shadows then inst.Shadows = false end
+        LightingState.effectStates = states
     end
-end
 
-local function pureSweep()
-    for _, container in ipairs({ Lighting, Workspace.CurrentCamera, LocalPlayer:FindFirstChild("PlayerGui") }) do
-        if container then
-            for _, inst in ipairs(container:GetDescendants()) do
-                pureKillEffect(inst)
+    local function suppressEffects()
+        for _, child in ipairs(Lighting:GetChildren()) do
+            Effects.kill(child, LightingState.effectStates)
+        end
+        local gui = LocalPlayer:FindFirstChild("PlayerGui")
+        if gui then
+            for _, obj in ipairs(gui:GetDescendants()) do
+                if obj:IsA("BlurEffect") then obj.Enabled = false end
             end
         end
     end
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        pureKillEffect(inst)
-        pureStripShadows(inst)
-    end
-end
 
-local function pureApplyProps()
-    Lighting.GlobalShadows = false
-    Lighting.ShadowSoftness = 0
-    Lighting.FogStart = 1e6
-    Lighting.FogEnd = 1e6
-    Lighting.Ambient = Color3.new(1, 1, 1)
-    Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
-    Lighting.ColorShift_Top = Color3.new(1, 1, 1)
-    Lighting.ColorShift_Bottom = Color3.new(1, 1, 1)
-    pcall(function() Lighting.EnvironmentDiffuseScale = 1 end)
-    pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
-    pcall(function() Lighting.ExposureCompensation = 0 end)
-end
+    local FULLBRIGHT_MAX = 6
 
-function Pure.enable()
-    if Pure.active then return end
-    Pure.active = true
+    local PURE_EFFECT_CLASSES = {
+        "BlurEffect", "ColorCorrectionEffect", "SunRaysEffect", "BloomEffect",
+        "DepthOfFieldEffect", "Atmosphere", "Sky",
+    }
 
-    Pure.props = {}
-    for _, prop in ipairs({ "ColorShift_Top", "ColorShift_Bottom", "EnvironmentDiffuseScale", "EnvironmentSpecularScale" }) do
-        local ok, value = pcall(function() return Lighting[prop] end)
-        if ok then Pure.props[prop] = value end
+    local Pure = {
+        active  = false,
+        effects = setmetatable({}, { __mode = "k" }),
+        parts   = setmetatable({}, { __mode = "k" }),
+        lights  = setmetatable({}, { __mode = "k" }),
+        props   = nil,
+    }
+
+    local function isPureEffect(inst)
+        for _, className in ipairs(PURE_EFFECT_CLASSES) do
+            if inst:IsA(className) then return true end
+        end
+        return false
     end
 
-    pureApplyProps()
-    pureSweep()
+    local function pureKillEffect(inst)
+        if not isPureEffect(inst) then return end
+        Effects.kill(inst, Pure.effects)
+    end
 
-    Master:Add(Workspace.DescendantAdded:Connect(function(inst)
-        if not Pure.active then return end
-        task.defer(function()
-            if not inst.Parent then return end
+    local function pureStripShadows(inst)
+        if inst:IsA("BasePart") then
+            if Pure.parts[inst] == nil then
+                Pure.parts[inst] = inst.CastShadow
+            end
+            if inst.CastShadow then inst.CastShadow = false end
+        elseif inst:IsA("Light") then
+            if Pure.lights[inst] == nil then
+                Pure.lights[inst] = inst.Shadows
+            end
+            if inst.Shadows then inst.Shadows = false end
+        end
+    end
+
+    local function pureSweep()
+        for _, container in ipairs({ Lighting, Workspace.CurrentCamera, LocalPlayer:FindFirstChild("PlayerGui") }) do
+            if container then
+                for _, inst in ipairs(container:GetDescendants()) do
+                    pureKillEffect(inst)
+                end
+            end
+        end
+        for _, inst in ipairs(Workspace:GetDescendants()) do
             pureKillEffect(inst)
             pureStripShadows(inst)
-        end)
-    end), "pureAdded")
+        end
+    end
 
-    Master:Add(Lighting.DescendantAdded:Connect(function(inst)
-        if not Pure.active then return end
-        task.defer(function()
-            if inst.Parent then pureKillEffect(inst) end
-        end)
-    end), "pureLighting")
+    local function pureApplyProps()
+        Lighting.GlobalShadows = false
+        Lighting.ShadowSoftness = 0
+        Lighting.FogStart = 1e6
+        Lighting.FogEnd = 1e6
+        Lighting.Ambient = Color3.new(1, 1, 1)
+        Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+        Lighting.ColorShift_Top = Color3.new(1, 1, 1)
+        Lighting.ColorShift_Bottom = Color3.new(1, 1, 1)
+        pcall(function() Lighting.EnvironmentDiffuseScale = 1 end)
+        pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
+        pcall(function() Lighting.ExposureCompensation = 0 end)
+    end
 
-    local accumulator = 0
-    Master:Add(RunService.Heartbeat:Connect(function(dt)
-        if not Pure.active then return end
-        accumulator += dt
-        if accumulator < 2 then return end
-        accumulator = 0
+    function Pure.enable()
+        if Pure.active then return end
+        Pure.active = true
+
+        Pure.props = {}
+        for _, prop in ipairs({ "ColorShift_Top", "ColorShift_Bottom", "EnvironmentDiffuseScale", "EnvironmentSpecularScale" }) do
+            local ok, value = pcall(function() return Lighting[prop] end)
+            if ok then Pure.props[prop] = value end
+        end
+
         pureApplyProps()
         pureSweep()
-    end), "pureHold")
-end
 
-function Pure.disable()
-    if not Pure.active then return end
-    Pure.active = false
+        Master:Add(Workspace.DescendantAdded:Connect(function(inst)
+            if not Pure.active then return end
+            task.defer(function()
+                if not inst.Parent then return end
+                pureKillEffect(inst)
+                pureStripShadows(inst)
+            end)
+        end), "pureAdded")
 
-    Master:Remove("pureAdded")
-    Master:Remove("pureLighting")
-    Master:Remove("pureHold")
+        Master:Add(Lighting.DescendantAdded:Connect(function(inst)
+            if not Pure.active then return end
+            task.defer(function()
+                if inst.Parent then pureKillEffect(inst) end
+            end)
+        end), "pureLighting")
 
-    Effects.restore()
-
-    for inst, wasEnabled in pairs(Pure.effects) do
-        if typeof(inst) == "Instance" and inst.Parent then
-            pcall(function() inst.Enabled = wasEnabled end)
-        end
-    end
-    for part, castShadow in pairs(Pure.parts) do
-        if typeof(part) == "Instance" and part.Parent then
-            pcall(function() part.CastShadow = castShadow end)
-        end
-    end
-    for light, shadows in pairs(Pure.lights) do
-        if typeof(light) == "Instance" and light.Parent then
-            pcall(function() light.Shadows = shadows end)
-        end
-    end
-    if Pure.props then
-        for prop, value in pairs(Pure.props) do
-            pcall(function() Lighting[prop] = value end)
-        end
+        local accumulator = 0
+        Master:Add(RunService.Heartbeat:Connect(function(dt)
+            if not Pure.active then return end
+            accumulator += dt
+            if accumulator < 2 then return end
+            accumulator = 0
+            pureApplyProps()
+            pureSweep()
+        end), "pureHold")
     end
 
-    Pure.effects = setmetatable({}, { __mode = "k" })
-    Pure.parts = setmetatable({}, { __mode = "k" })
-    Pure.lights = setmetatable({}, { __mode = "k" })
-    Pure.props = nil
-end
+    function Pure.disable()
+        if not Pure.active then return end
+        Pure.active = false
 
-local FULLBRIGHT_PROPS = {
-    Brightness = true, FogEnd = true, GlobalShadows = true,
-    Ambient = true, OutdoorAmbient = true, ShadowSoftness = true,
-}
+        Master:Remove("pureAdded")
+        Master:Remove("pureLighting")
+        Master:Remove("pureHold")
 
--- One setting, fully on: brightness at the top of the range and pure mode with
--- it, so every shadow, blur and post effect is stripped rather than dimmed.
-local function applyFullbright()
-    Lighting.Brightness = FULLBRIGHT_MAX
-    Lighting.FogEnd = 1e6
-    Lighting.GlobalShadows = false
-    Lighting.Ambient = Color3.fromRGB(255, 255, 255)
-    Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
-    Lighting.ShadowSoftness = 0
+        Effects.restore()
 
-    Pure.enable()
-end
-
-local function restoreLighting()
-    Pure.disable()
-    Effects.restore()
-    if not LightingState.snapshot then return end
-    for prop, value in pairs(LightingState.snapshot) do
-        pcall(function() Lighting[prop] = value end)
-    end
-    if LightingState.effectStates then
-        for effect, wasEnabled in pairs(LightingState.effectStates) do
-            if effect.Parent then
-                pcall(function() effect.Enabled = wasEnabled end)
+        for inst, wasEnabled in pairs(Pure.effects) do
+            if typeof(inst) == "Instance" and inst.Parent then
+                pcall(function() inst.Enabled = wasEnabled end)
             end
         end
-    end
-    LightingState.snapshot = nil
-    LightingState.effectStates = nil
-end
-
-Toggle(LightingGroup, "Fullbright", {
-    Text = "Fullbright",
-    Default = false,
-    Tooltip = "Full brightness with every shadow, blur and post-effect stripped",
-    Callback = function(state)
-        if state then
-            snapshotLighting()
-            applyFullbright()
-            suppressEffects()
-
-            Master:Add(Lighting.Changed:Connect(function(property)
-                if FULLBRIGHT_PROPS[property] and tog("Fullbright") then
-                    applyFullbright()
-                end
-            end), "fbChanged")
-
-            Master:Add(Lighting.ChildAdded:Connect(function(child)
-                if not tog("Fullbright") then return end
-                task.defer(function()
-                    if child.Parent then
-                        Effects.kill(child, LightingState.effectStates)
-                    end
-                end)
-            end), "fbChildAdded")
-
-            notify("Fullbright enabled.")
-        else
-            Master:Remove("fbChanged")
-            Master:Remove("fbChildAdded")
-            restoreLighting()
-            notify("Fullbright disabled.")
+        for part, castShadow in pairs(Pure.parts) do
+            if typeof(part) == "Instance" and part.Parent then
+                pcall(function() part.CastShadow = castShadow end)
+            end
         end
-    end,
-})
+        for light, shadows in pairs(Pure.lights) do
+            if typeof(light) == "Instance" and light.Parent then
+                pcall(function() light.Shadows = shadows end)
+            end
+        end
+        if Pure.props then
+            for prop, value in pairs(Pure.props) do
+                pcall(function() Lighting[prop] = value end)
+            end
+        end
+
+        Pure.effects = setmetatable({}, { __mode = "k" })
+        Pure.parts = setmetatable({}, { __mode = "k" })
+        Pure.lights = setmetatable({}, { __mode = "k" })
+        Pure.props = nil
+    end
+
+    local FULLBRIGHT_PROPS = {
+        Brightness = true, FogEnd = true, GlobalShadows = true,
+        Ambient = true, OutdoorAmbient = true, ShadowSoftness = true,
+    }
+
+    -- One setting, fully on: brightness at the top of the range and pure mode with
+    -- it, so every shadow, blur and post effect is stripped rather than dimmed.
+    local function applyFullbright()
+        Lighting.Brightness = FULLBRIGHT_MAX
+        Lighting.FogEnd = 1e6
+        Lighting.GlobalShadows = false
+        Lighting.Ambient = Color3.fromRGB(255, 255, 255)
+        Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+        Lighting.ShadowSoftness = 0
+
+        Pure.enable()
+    end
+
+    function restoreLighting()
+        Pure.disable()
+        Effects.restore()
+        if not LightingState.snapshot then return end
+        for prop, value in pairs(LightingState.snapshot) do
+            pcall(function() Lighting[prop] = value end)
+        end
+        if LightingState.effectStates then
+            for effect, wasEnabled in pairs(LightingState.effectStates) do
+                if effect.Parent then
+                    pcall(function() effect.Enabled = wasEnabled end)
+                end
+            end
+        end
+        LightingState.snapshot = nil
+        LightingState.effectStates = nil
+    end
+
+    Toggle(LightingGroup, "Fullbright", {
+        Text = "Fullbright",
+        Default = false,
+        Tooltip = "Full brightness with every shadow, blur and post-effect stripped",
+        Callback = function(state)
+            if state then
+                snapshotLighting()
+                applyFullbright()
+                suppressEffects()
+
+                Master:Add(Lighting.Changed:Connect(function(property)
+                    if FULLBRIGHT_PROPS[property] and tog("Fullbright") then
+                        applyFullbright()
+                    end
+                end), "fbChanged")
+
+                Master:Add(Lighting.ChildAdded:Connect(function(child)
+                    if not tog("Fullbright") then return end
+                    task.defer(function()
+                        if child.Parent then
+                            Effects.kill(child, LightingState.effectStates)
+                        end
+                    end)
+                end), "fbChildAdded")
+
+                notify("Fullbright enabled.")
+            else
+                Master:Remove("fbChanged")
+                Master:Remove("fbChildAdded")
+                restoreLighting()
+                notify("Fullbright disabled.")
+            end
+        end,
+    })
+end
 
 local CameraState = { defaultMin = 0.5, defaultMax = 128 }
 
@@ -3055,504 +3061,510 @@ do
     end))
 end
 
-local WOODPILE_CF  = CFrame.new(-27.149, 8.7, -118.611)
-local FIREPLACE_CF = CFrame.new(-45.113, 7.84, -60.241)
-local GENERATOR_CF = CFrame.new(-76.039, 4.675, -133.78)
+-- Scoped: nothing here is used outside the Night 1 tab.
+do
+    local WOODPILE_CF  = CFrame.new(-27.149, 8.7, -118.611)
+    local FIREPLACE_CF = CFrame.new(-45.113, 7.84, -60.241)
+    local GENERATOR_CF = CFrame.new(-76.039, 4.675, -133.78)
 
-local function woodPileDetector()
-    local pile = Workspace:FindFirstChild("WoodPile")
-    local detector = pile and pile:FindFirstChild("Detector")
-    if not detector then return nil end
-    detector.CanCollide = false
-    return detector:FindFirstChildOfClass("ClickDetector")
-end
-
-local function grabAt(destination, trigger, label)
-    local before = toolSnapshot()
-    local held = nil
-
-    local done = runAt(destination, function()
-        interact(trigger)
-    end, function()
-        held = newToolSince(before)
-        return held ~= nil
-    end)
-
-    if done then
-        notify(("%s picked up."):format(label))
-    else
-        notify(("%s did not register a pickup — check you are close enough."):format(label), 5)
+    local function woodPileDetector()
+        local pile = Workspace:FindFirstChild("WoodPile")
+        local detector = pile and pile:FindFirstChild("Detector")
+        if not detector then return nil end
+        detector.CanCollide = false
+        return detector:FindFirstChildOfClass("ClickDetector")
     end
-    return done, held
-end
 
-Button(N1ActGroup, "Grab Wood", "Teleports to the pile and returns the instant the log is in hand", function()
-    local click = woodPileDetector()
-    if not click then return notify("Wood pile not found.") end
-    pushPosition()
-    grabAt(WOODPILE_CF, click, "Wood")
-end)
+    local function grabAt(destination, trigger, label)
+        local before = toolSnapshot()
+        local held = nil
 
-Button(N1ActGroup, "Refill Fireplace", "Grabs wood, delivers it, returns the instant it is consumed", function()
-    local click = woodPileDetector()
-    if not click then return notify("Wood pile not found.") end
-
-    local char, root = Char.require()
-    local origin = root.CFrame
-    local before = toolSnapshot()
-    pushPosition()
-    Collision.acquire("fireplace")
-
-    local delivered = false
-    local ok, err = pcall(function()
-        char:PivotTo(WOODPILE_CF)
-        zeroVelocity(root)
-
-        local log
-        local grabbed = actUntil(function()
-            interact(click)
+        local done = runAt(destination, function()
+            interact(trigger)
         end, function()
-            log = newToolSince(before)
-            return log ~= nil
+            held = newToolSince(before)
+            return held ~= nil
         end)
 
-        if not grabbed then return end
-
-        char:PivotTo(FIREPLACE_CF)
-        zeroVelocity(root)
-
-        delivered = actUntil(function()
-            local fireplace = Workspace:FindFirstChild("Fireplace")
-            if fireplace then interact(fireplace) end
-        end, function()
-            return toolGone(log)
-        end)
-    end)
-
-    char:PivotTo(origin)
-    zeroVelocity(root)
-    Collision.release("fireplace")
-
-    if not ok then error(err, 0) end
-    notify(delivered and "Fireplace refilled." or "Wood was not consumed — you may already be full.", 5)
-end)
-
-Button(N1ActGroup, "Grab JerryCan", "Returns the instant the can is in hand", function()
-    local shack = Workspace:FindFirstChild("Shack")
-    local can = shack and shack:FindFirstChild("JerryCan")
-    local click = can and can:FindFirstChildOfClass("ClickDetector")
-    if not click then return notify("JerryCan not found.") end
-    pushPosition()
-    grabAt(GENERATOR_CF, click, "JerryCan")
-end)
-
-Button(N1ActGroup, "Refill Generator", "Grabs the can, fuels the generator, returns on completion", function()
-    local shack = Workspace:FindFirstChild("Shack")
-    if not shack then return notify("Shack not found.") end
-    local can = shack:FindFirstChild("JerryCan")
-    local gen = shack:FindFirstChild("Generator")
-    local canClick = can and can:FindFirstChildOfClass("ClickDetector")
-    local genClick = gen and gen:FindFirstChildOfClass("ClickDetector")
-    if not (canClick and genClick) then return notify("Generator or can not found.") end
-
-    local before = toolSnapshot()
-    pushPosition()
-
-    local fuelled = false
-    local stage = 1
-    local fuel
-
-    runAt(GENERATOR_CF, function()
-        if stage == 1 then
-            Exec.clickDetector(canClick)
-            fuel = newToolSince(before)
-            if fuel then stage = 2 end
+        if done then
+            notify(("%s picked up."):format(label))
         else
-            Exec.clickDetector(genClick)
+            notify(("%s did not register a pickup — check you are close enough."):format(label), 5)
         end
-    end, function()
-        if stage == 1 then return false end
-        fuelled = toolGone(fuel)
-        return fuelled
-    end)
-
-    notify(fuelled and "Generator refilled." or "Could not confirm the refill — try again closer.", 5)
-end)
-
-Toggle(N1ActGroup, "AutoFireplace", {
-    Text = "Auto Fireplace",
-    Default = false,
-    Tooltip = "Keeps the fireplace topped up on a timer",
-    Callback = function(state)
-        if not state then return end
-        spawnSafe(function()
-            while tog("AutoFireplace") do
-                local click = woodPileDetector()
-                if click then
-                    local char, root = Char.require()
-                    local origin = root.CFrame
-                    local before = toolSnapshot()
-                    Collision.acquire("autoFire")
-                    pcall(function()
-                        char:PivotTo(WOODPILE_CF)
-                        zeroVelocity(root)
-
-                        local log
-                        local grabbed = actUntil(function()
-                            interact(click)
-                        end, function()
-                            log = newToolSince(before)
-                            return log ~= nil
-                        end, 3)
-
-                        if grabbed then
-                            char:PivotTo(FIREPLACE_CF)
-                            zeroVelocity(root)
-                            actUntil(function()
-                                local fireplace = Workspace:FindFirstChild("Fireplace")
-                                if fireplace then interact(fireplace) end
-                            end, function()
-                                return toolGone(log)
-                            end, 3)
-                        end
-                    end)
-                    char:PivotTo(origin)
-                    zeroVelocity(root)
-                    Collision.release("autoFire")
-                end
-                task.wait(opt("AutoFireplaceDelay", 45))
-            end
-        end, "Auto fireplace")
-    end,
-})
-
-N1ActGroup:AddSlider("AutoFireplaceDelay", {
-    Text = "Fireplace interval",
-    Default = 45,
-    Min = 10,
-    Max = 180,
-    Rounding = 0,
-    Suffix = "s",
-})
-
-local upgradeFrameState
-
-ToggleButton(N1ActGroup, "Open Upgrade Frame",
-    "Press again to close it again",
-    function()
-        local gui = LocalPlayer:FindFirstChild("PlayerGui")
-        local dialogue = gui and gui:FindFirstChild("DialogueUI")
-        local frame = dialogue and dialogue:FindFirstChild("UpgradeFrame")
-        if not frame then
-            notify("UpgradeFrame not found.")
-            return false
-        end
-        upgradeFrameState = { inst = frame, visible = frame.Visible, position = frame.Position }
-        frame.Visible = true
-        frame.Position = UDim2.new(0.499, 0, 0.5, 0)
-        notify("Upgrade frame opened.")
-    end,
-    function()
-        local saved = upgradeFrameState
-        upgradeFrameState = nil
-        if saved and saved.inst.Parent then
-            pcall(function()
-                saved.inst.Visible = saved.visible
-                saved.inst.Position = saved.position
-            end)
-        end
-        notify("Upgrade frame closed.")
-    end)
-
-local gamblerCupColors = {}
-
-ToggleButton(N1ActGroup, "Mark Gambler Cups",
-    "Colours the cups so the shell game is readable — press again to restore their colours",
-    function()
-        local assets = ReplicatedStorage:FindFirstChild("Assets")
-        local gambler = (assets and assets:FindFirstChild("Gambler")) or Workspace:FindFirstChild("Gambler")
-        local cups = gambler and gambler:FindFirstChild("Cups")
-        if not cups then
-            notify("Gambler cups not found.")
-            return false
-        end
-
-        local one, three = cups:FindFirstChild("1"), cups:FindFirstChild("3")
-        if one then
-            table.insert(gamblerCupColors, { inst = one, color = one.BrickColor })
-            one.BrickColor = BrickColor.new("Really red")
-        end
-        if three then
-            table.insert(gamblerCupColors, { inst = three, color = three.BrickColor })
-            three.BrickColor = BrickColor.new("Lime green")
-        end
-        notify("Cups marked.")
-    end,
-    function()
-        for _, entry in ipairs(gamblerCupColors) do
-            if entry.inst.Parent then
-                pcall(function() entry.inst.BrickColor = entry.color end)
-            end
-        end
-        gamblerCupColors = {}
-        notify("Cup colours restored.")
-    end)
-
-local cameraRoutineBusy = false
-local CAMERA_TARGETS = {
-    { cf = CFrame.new(-51.5, 18, -89),   lookBack = false },
-    { cf = CFrame.new(-14.75, 18, -120), lookBack = true },
-    { cf = CFrame.new(-18.75, 18, 27),   lookBack = false },
-}
-
-Button(N1ActGroup, "Fix All Cameras", "Visits each camera and clicks it", function()
-    if cameraRoutineBusy then
-        return notify("Camera routine already running.")
-    end
-    if not Exec.hasMouse then
-        notify("Warning: mousemoverel unsupported — cursor lock skipped.", 5)
+        return done, held
     end
 
-    cameraRoutineBusy = true
-    local routine = Janitor.new()
-    Collision.acquire("cameraRoutine")
+    Button(N1ActGroup, "Grab Wood", "Teleports to the pile and returns the instant the log is in hand", function()
+        local click = woodPileDetector()
+        if not click then return notify("Wood pile not found.") end
+        pushPosition()
+        grabAt(WOODPILE_CF, click, "Wood")
+    end)
 
-    local ok, err = pcall(function()
-        local _, root = Char.require()
-        local hum = Char.humanoid()
+    Button(N1ActGroup, "Refill Fireplace", "Grabs wood, delivers it, returns the instant it is consumed", function()
+        local click = woodPileDetector()
+        if not click then return notify("Wood pile not found.") end
+
+        local char, root = Char.require()
         local origin = root.CFrame
-        local camera = Workspace.CurrentCamera
+        local before = toolSnapshot()
+        pushPosition()
+        Collision.acquire("fireplace")
 
-        if Exec.hasMouse then
-            routine:Add(RunService.RenderStepped:Connect(function()
-                local viewport = camera.ViewportSize
-                local mouse = UserInputService:GetMouseLocation()
-                Exec.mouseMoveRel(
-                    (viewport.X / 2) - mouse.X,
-                    (viewport.Y / 2) - 125 - mouse.Y
-                )
-            end))
-        end
-
-        if hum then hum.PlatformStand = true end
-
-        local function frameCamera(position, lookBack)
-            local offset = lookBack and Vector3.new(0, 3, 10) or Vector3.new(0, 3, -10)
-            camera.CFrame = CFrame.lookAt(position + offset, position + Vector3.new(0, 2, 0))
-        end
-
-        local function glideTo(targetCF)
-            local start = root.Position
-            local finish = targetCF.Position
-            local duration = math.clamp((finish - start).Magnitude / 290, 0.05, 0.5)
-            local elapsed = 0
-
-            while elapsed < duration do
-                elapsed += RunService.RenderStepped:Wait()
-                local alpha = math.clamp(elapsed / duration, 0, 1)
-                root.CFrame = CFrame.new(start:Lerp(finish, alpha))
-                zeroVelocity(root)
-                frameCamera(root.Position, false)
-            end
-
-            root.CFrame = targetCF
+        local delivered = false
+        local ok, err = pcall(function()
+            char:PivotTo(WOODPILE_CF)
             zeroVelocity(root)
+
+            local log
+            local grabbed = actUntil(function()
+                interact(click)
+            end, function()
+                log = newToolSince(before)
+                return log ~= nil
+            end)
+
+            if not grabbed then return end
+
+            char:PivotTo(FIREPLACE_CF)
+            zeroVelocity(root)
+
+            delivered = actUntil(function()
+                local fireplace = Workspace:FindFirstChild("Fireplace")
+                if fireplace then interact(fireplace) end
+            end, function()
+                return toolGone(log)
+            end)
+        end)
+
+        char:PivotTo(origin)
+        zeroVelocity(root)
+        Collision.release("fireplace")
+
+        if not ok then error(err, 0) end
+        notify(delivered and "Fireplace refilled." or "Wood was not consumed — you may already be full.", 5)
+    end)
+
+    Button(N1ActGroup, "Grab JerryCan", "Returns the instant the can is in hand", function()
+        local shack = Workspace:FindFirstChild("Shack")
+        local can = shack and shack:FindFirstChild("JerryCan")
+        local click = can and can:FindFirstChildOfClass("ClickDetector")
+        if not click then return notify("JerryCan not found.") end
+        pushPosition()
+        grabAt(GENERATOR_CF, click, "JerryCan")
+    end)
+
+    Button(N1ActGroup, "Refill Generator", "Grabs the can, fuels the generator, returns on completion", function()
+        local shack = Workspace:FindFirstChild("Shack")
+        if not shack then return notify("Shack not found.") end
+        local can = shack:FindFirstChild("JerryCan")
+        local gen = shack:FindFirstChild("Generator")
+        local canClick = can and can:FindFirstChildOfClass("ClickDetector")
+        local genClick = gen and gen:FindFirstChildOfClass("ClickDetector")
+        if not (canClick and genClick) then return notify("Generator or can not found.") end
+
+        local before = toolSnapshot()
+        pushPosition()
+
+        local fuelled = false
+        local stage = 1
+        local fuel
+
+        runAt(GENERATOR_CF, function()
+            if stage == 1 then
+                Exec.clickDetector(canClick)
+                fuel = newToolSince(before)
+                if fuel then stage = 2 end
+            else
+                Exec.clickDetector(genClick)
+            end
+        end, function()
+            if stage == 1 then return false end
+            fuelled = toolGone(fuel)
+            return fuelled
+        end)
+
+        notify(fuelled and "Generator refilled." or "Could not confirm the refill — try again closer.", 5)
+    end)
+
+    Toggle(N1ActGroup, "AutoFireplace", {
+        Text = "Auto Fireplace",
+        Default = false,
+        Tooltip = "Keeps the fireplace topped up on a timer",
+        Callback = function(state)
+            if not state then return end
+            spawnSafe(function()
+                while tog("AutoFireplace") do
+                    local click = woodPileDetector()
+                    if click then
+                        local char, root = Char.require()
+                        local origin = root.CFrame
+                        local before = toolSnapshot()
+                        Collision.acquire("autoFire")
+                        pcall(function()
+                            char:PivotTo(WOODPILE_CF)
+                            zeroVelocity(root)
+
+                            local log
+                            local grabbed = actUntil(function()
+                                interact(click)
+                            end, function()
+                                log = newToolSince(before)
+                                return log ~= nil
+                            end, 3)
+
+                            if grabbed then
+                                char:PivotTo(FIREPLACE_CF)
+                                zeroVelocity(root)
+                                actUntil(function()
+                                    local fireplace = Workspace:FindFirstChild("Fireplace")
+                                    if fireplace then interact(fireplace) end
+                                end, function()
+                                    return toolGone(log)
+                                end, 3)
+                            end
+                        end)
+                        char:PivotTo(origin)
+                        zeroVelocity(root)
+                        Collision.release("autoFire")
+                    end
+                    task.wait(opt("AutoFireplaceDelay", 45))
+                end
+            end, "Auto fireplace")
+        end,
+    })
+
+    N1ActGroup:AddSlider("AutoFireplaceDelay", {
+        Text = "Fireplace interval",
+        Default = 45,
+        Min = 10,
+        Max = 180,
+        Rounding = 0,
+        Suffix = "s",
+    })
+
+    local upgradeFrameState
+
+    ToggleButton(N1ActGroup, "Open Upgrade Frame",
+        "Press again to close it again",
+        function()
+            local gui = LocalPlayer:FindFirstChild("PlayerGui")
+            local dialogue = gui and gui:FindFirstChild("DialogueUI")
+            local frame = dialogue and dialogue:FindFirstChild("UpgradeFrame")
+            if not frame then
+                notify("UpgradeFrame not found.")
+                return false
+            end
+            upgradeFrameState = { inst = frame, visible = frame.Visible, position = frame.Position }
+            frame.Visible = true
+            frame.Position = UDim2.new(0.499, 0, 0.5, 0)
+            notify("Upgrade frame opened.")
+        end,
+        function()
+            local saved = upgradeFrameState
+            upgradeFrameState = nil
+            if saved and saved.inst.Parent then
+                pcall(function()
+                    saved.inst.Visible = saved.visible
+                    saved.inst.Position = saved.position
+                end)
+            end
+            notify("Upgrade frame closed.")
+        end)
+
+    local gamblerCupColors = {}
+
+    ToggleButton(N1ActGroup, "Mark Gambler Cups",
+        "Colours the cups so the shell game is readable — press again to restore their colours",
+        function()
+            local assets = ReplicatedStorage:FindFirstChild("Assets")
+            local gambler = (assets and assets:FindFirstChild("Gambler")) or Workspace:FindFirstChild("Gambler")
+            local cups = gambler and gambler:FindFirstChild("Cups")
+            if not cups then
+                notify("Gambler cups not found.")
+                return false
+            end
+
+            local one, three = cups:FindFirstChild("1"), cups:FindFirstChild("3")
+            if one then
+                table.insert(gamblerCupColors, { inst = one, color = one.BrickColor })
+                one.BrickColor = BrickColor.new("Really red")
+            end
+            if three then
+                table.insert(gamblerCupColors, { inst = three, color = three.BrickColor })
+                three.BrickColor = BrickColor.new("Lime green")
+            end
+            notify("Cups marked.")
+        end,
+        function()
+            for _, entry in ipairs(gamblerCupColors) do
+                if entry.inst.Parent then
+                    pcall(function() entry.inst.BrickColor = entry.color end)
+                end
+            end
+            gamblerCupColors = {}
+            notify("Cup colours restored.")
+        end)
+
+    local cameraRoutineBusy = false
+    local CAMERA_TARGETS = {
+        { cf = CFrame.new(-51.5, 18, -89),   lookBack = false },
+        { cf = CFrame.new(-14.75, 18, -120), lookBack = true },
+        { cf = CFrame.new(-18.75, 18, 27),   lookBack = false },
+    }
+
+    Button(N1ActGroup, "Fix All Cameras", "Visits each camera and clicks it", function()
+        if cameraRoutineBusy then
+            return notify("Camera routine already running.")
+        end
+        if not Exec.hasMouse then
+            notify("Warning: mousemoverel unsupported — cursor lock skipped.", 5)
         end
 
-        for _, target in ipairs(CAMERA_TARGETS) do
-            glideTo(target.cf)
+        cameraRoutineBusy = true
+        local routine = Janitor.new()
+        Collision.acquire("cameraRoutine")
 
-            local timer = 0
-            while timer < 0.08 do
-                timer += RunService.RenderStepped:Wait()
-                root.CFrame = target.cf
+        local ok, err = pcall(function()
+            local _, root = Char.require()
+            local hum = Char.humanoid()
+            local origin = root.CFrame
+            local camera = Workspace.CurrentCamera
+
+            if Exec.hasMouse then
+                routine:Add(RunService.RenderStepped:Connect(function()
+                    local viewport = camera.ViewportSize
+                    local mouse = UserInputService:GetMouseLocation()
+                    Exec.mouseMoveRel(
+                        (viewport.X / 2) - mouse.X,
+                        (viewport.Y / 2) - 125 - mouse.Y
+                    )
+                end))
+            end
+
+            if hum then hum.PlatformStand = true end
+
+            local function frameCamera(position, lookBack)
+                local offset = lookBack and Vector3.new(0, 3, 10) or Vector3.new(0, 3, -10)
+                camera.CFrame = CFrame.lookAt(position + offset, position + Vector3.new(0, 2, 0))
+            end
+
+            local function glideTo(targetCF)
+                local start = root.Position
+                local finish = targetCF.Position
+                local duration = math.clamp((finish - start).Magnitude / 290, 0.05, 0.5)
+                local elapsed = 0
+
+                while elapsed < duration do
+                    elapsed += RunService.RenderStepped:Wait()
+                    local alpha = math.clamp(elapsed / duration, 0, 1)
+                    root.CFrame = CFrame.new(start:Lerp(finish, alpha))
+                    zeroVelocity(root)
+                    frameCamera(root.Position, false)
+                end
+
+                root.CFrame = targetCF
                 zeroVelocity(root)
-                frameCamera(root.Position, target.lookBack)
-
-                local mouse = UserInputService:GetMouseLocation()
-                VirtualInputManager:SendMouseButtonEvent(mouse.X, mouse.Y, 0, true, game, 0)
-                task.wait(0.005)
-                VirtualInputManager:SendMouseButtonEvent(mouse.X, mouse.Y, 0, false, game, 0)
-                task.wait(0.01)
             end
 
-            if target.lookBack then
-                frameCamera(root.Position, false)
-            end
-        end
+            for _, target in ipairs(CAMERA_TARGETS) do
+                glideTo(target.cf)
 
+                local timer = 0
+                while timer < 0.08 do
+                    timer += RunService.RenderStepped:Wait()
+                    root.CFrame = target.cf
+                    zeroVelocity(root)
+                    frameCamera(root.Position, target.lookBack)
+
+                    local mouse = UserInputService:GetMouseLocation()
+                    VirtualInputManager:SendMouseButtonEvent(mouse.X, mouse.Y, 0, true, game, 0)
+                    task.wait(0.005)
+                    VirtualInputManager:SendMouseButtonEvent(mouse.X, mouse.Y, 0, false, game, 0)
+                    task.wait(0.01)
+                end
+
+                if target.lookBack then
+                    frameCamera(root.Position, false)
+                end
+            end
+
+            if hum then hum.PlatformStand = false end
+            root.CFrame = origin
+            zeroVelocity(root)
+        end)
+
+        routine:Clean()
+        Collision.release("cameraRoutine")
+
+        local hum = Char.humanoid()
         if hum then hum.PlatformStand = false end
-        root.CFrame = origin
+
+        cameraRoutineBusy = false
+        if not ok then error(err, 0) end
+        notify("All cameras fixed.")
+    end)
+end
+
+-- Scoped: nothing here is used outside the Night 2 tab.
+do
+    local grantedTablet
+
+    ToggleButton(N2ActGroup, "Give Tablet",
+        "Press again to take the tablet back off you",
+        function()
+            local items = ReplicatedStorage:FindFirstChild("Items")
+            local tablet = items and items:FindFirstChild("Tablet")
+            if not tablet then
+                notify("Tablet asset not found.")
+                return false
+            end
+            local char = Char.require()
+            grantedTablet = tablet:Clone()
+            grantedTablet.Parent = char
+            notify("Tablet granted.")
+        end,
+        function()
+            if grantedTablet then
+                pcall(function() grantedTablet:Destroy() end)
+            end
+            grantedTablet = nil
+            notify("Tablet removed.")
+        end)
+
+    Button(N2ActGroup, "Refill Power", "Collects the power cell and loads the generator", function()
+        local cell = Workspace:FindFirstChild("PowerCell")
+        local gen = Workspace:FindFirstChild("Generator")
+        local cellClick = cell and cell:FindFirstChildWhichIsA("ClickDetector", true)
+        local genClick = gen and gen:FindFirstChildWhichIsA("ClickDetector", true)
+        if not (cellClick and genClick) then return notify("Power cell or generator not found.") end
+
+        local char, root = Char.require()
+        local origin = root.CFrame
+        local before = toolSnapshot()
+        pushPosition()
+        Collision.acquire("power")
+
+        local loaded = false
+        local ok, err = pcall(function()
+            char:PivotTo(CFrame.new(-318.60, 82.4, 97.89))
+            zeroVelocity(root)
+
+            local cellTool
+            local collected = actUntil(function()
+                Exec.clickDetector(cellClick)
+            end, function()
+                cellTool = newToolSince(before)
+                return cellTool ~= nil or not cellClick.Parent
+            end, 3)
+
+            if not collected then return end
+
+            char:PivotTo(CFrame.new(-271.36, 82.4, 112.97))
+            zeroVelocity(root)
+
+            loaded = actUntil(function()
+                Exec.clickDetector(genClick)
+            end, function()
+                if cellTool then return toolGone(cellTool) end
+                return not genClick.Parent
+            end, 3)
+        end)
+
+        char:PivotTo(origin)
         zeroVelocity(root)
+        Collision.release("power")
+
+        if not ok then error(err, 0) end
+        notify(loaded and "Power refilled." or "Could not confirm the refill.", 5)
     end)
 
-    routine:Clean()
-    Collision.release("cameraRoutine")
+    local lookAtRemote
 
-    local hum = Char.humanoid()
-    if hum then hum.PlatformStand = false end
+    ToggleButton(N2ActGroup, "Disable Stalker Gaze Damage",
+        "Detaches the LookAt remote — press again to put it back",
+        function()
+            local folder = remotes()
+            local lookAt = folder and folder:FindFirstChild("LookAt")
+            if not lookAt then
+                notify("LookAt remote not found (already removed?).")
+                return false
+            end
+            lookAtRemote = { inst = lookAt, parent = lookAt.Parent }
+            lookAt.Parent = nil
+            notify("Immune to Stalker gaze damage.")
+        end,
+        function()
+            local saved = lookAtRemote
+            lookAtRemote = nil
+            if saved and saved.parent and saved.parent.Parent then
+                pcall(function() saved.inst.Parent = saved.parent end)
+            end
+            notify("LookAt remote restored.")
+        end)
 
-    cameraRoutineBusy = false
-    if not ok then error(err, 0) end
-    notify("All cameras fixed.")
-end)
+    local ventHitboxes = {}
 
-local grantedTablet
-
-ToggleButton(N2ActGroup, "Give Tablet",
-    "Press again to take the tablet back off you",
-    function()
-        local items = ReplicatedStorage:FindFirstChild("Items")
-        local tablet = items and items:FindFirstChild("Tablet")
-        if not tablet then
-            notify("Tablet asset not found.")
-            return false
-        end
-        local char = Char.require()
-        grantedTablet = tablet:Clone()
-        grantedTablet.Parent = char
-        notify("Tablet granted.")
-    end,
-    function()
-        if grantedTablet then
-            pcall(function() grantedTablet:Destroy() end)
-        end
-        grantedTablet = nil
-        notify("Tablet removed.")
-    end)
-
-Button(N2ActGroup, "Refill Power", "Collects the power cell and loads the generator", function()
-    local cell = Workspace:FindFirstChild("PowerCell")
-    local gen = Workspace:FindFirstChild("Generator")
-    local cellClick = cell and cell:FindFirstChildWhichIsA("ClickDetector", true)
-    local genClick = gen and gen:FindFirstChildWhichIsA("ClickDetector", true)
-    if not (cellClick and genClick) then return notify("Power cell or generator not found.") end
-
-    local char, root = Char.require()
-    local origin = root.CFrame
-    local before = toolSnapshot()
-    pushPosition()
-    Collision.acquire("power")
-
-    local loaded = false
-    local ok, err = pcall(function()
-        char:PivotTo(CFrame.new(-318.60, 82.4, 97.89))
-        zeroVelocity(root)
-
-        local cellTool
-        local collected = actUntil(function()
-            Exec.clickDetector(cellClick)
-        end, function()
-            cellTool = newToolSince(before)
-            return cellTool ~= nil or not cellClick.Parent
-        end, 3)
-
-        if not collected then return end
-
-        char:PivotTo(CFrame.new(-271.36, 82.4, 112.97))
-        zeroVelocity(root)
-
-        loaded = actUntil(function()
-            Exec.clickDetector(genClick)
-        end, function()
-            if cellTool then return toolGone(cellTool) end
-            return not genClick.Parent
-        end, 3)
-    end)
-
-    char:PivotTo(origin)
-    zeroVelocity(root)
-    Collision.release("power")
-
-    if not ok then error(err, 0) end
-    notify(loaded and "Power refilled." or "Could not confirm the refill.", 5)
-end)
-
-local lookAtRemote
-
-ToggleButton(N2ActGroup, "Disable Stalker Gaze Damage",
-    "Detaches the LookAt remote — press again to put it back",
-    function()
-        local folder = remotes()
-        local lookAt = folder and folder:FindFirstChild("LookAt")
-        if not lookAt then
-            notify("LookAt remote not found (already removed?).")
-            return false
-        end
-        lookAtRemote = { inst = lookAt, parent = lookAt.Parent }
-        lookAt.Parent = nil
-        notify("Immune to Stalker gaze damage.")
-    end,
-    function()
-        local saved = lookAtRemote
-        lookAtRemote = nil
-        if saved and saved.parent and saved.parent.Parent then
-            pcall(function() saved.inst.Parent = saved.parent end)
-        end
-        notify("LookAt remote restored.")
-    end)
-
-local ventHitboxes = {}
-
-ToggleButton(N2ActGroup, "Anti Vent-Pest",
-    "Detaches vent grab hitboxes — press again to put them back",
-    function()
-        local grids = Workspace:FindFirstChild("Grids")
-        if not grids then
-            notify("Grids folder not found.")
-            return false
-        end
-        local removed = 0
-        for _, grid in ipairs(grids:GetChildren()) do
-            for _, child in ipairs(grid:GetDescendants()) do
-                if child:IsA("BasePart") and child.Name == "Hitbox" then
-                    table.insert(ventHitboxes, { inst = child, parent = child.Parent })
-                    child.Parent = nil
-                    removed += 1
+    ToggleButton(N2ActGroup, "Anti Vent-Pest",
+        "Detaches vent grab hitboxes — press again to put them back",
+        function()
+            local grids = Workspace:FindFirstChild("Grids")
+            if not grids then
+                notify("Grids folder not found.")
+                return false
+            end
+            local removed = 0
+            for _, grid in ipairs(grids:GetChildren()) do
+                for _, child in ipairs(grid:GetDescendants()) do
+                    if child:IsA("BasePart") and child.Name == "Hitbox" then
+                        table.insert(ventHitboxes, { inst = child, parent = child.Parent })
+                        child.Parent = nil
+                        removed += 1
+                    end
                 end
             end
-        end
-        notify(("Removed %d vent hitbox(es)."):format(removed))
-    end,
-    function()
-        local restored = 0
-        for _, entry in ipairs(ventHitboxes) do
-            if entry.parent and entry.parent.Parent then
-                if pcall(function() entry.inst.Parent = entry.parent end) then
-                    restored += 1
+            notify(("Removed %d vent hitbox(es)."):format(removed))
+        end,
+        function()
+            local restored = 0
+            for _, entry in ipairs(ventHitboxes) do
+                if entry.parent and entry.parent.Parent then
+                    if pcall(function() entry.inst.Parent = entry.parent end) then
+                        restored += 1
+                    end
                 end
             end
-        end
-        ventHitboxes = {}
-        notify(("Restored %d vent hitbox(es)."):format(restored))
+            ventHitboxes = {}
+            notify(("Restored %d vent hitbox(es)."):format(restored))
+        end)
+
+    Button(N2ActGroup, "Revive", nil, function()
+        if fireRemote("LoadCharacter") then notify("Revive requested.") end
     end)
 
-Button(N2ActGroup, "Revive", nil, function()
-    if fireRemote("LoadCharacter") then notify("Revive requested.") end
-end)
+    Button(N2ActGroup, "Escape Snatch", nil, function()
+        if fireRemote("EscapeSnatch") then notify("Escaped the snatch!") end
+    end)
 
-Button(N2ActGroup, "Escape Snatch", nil, function()
-    if fireRemote("EscapeSnatch") then notify("Escaped the snatch!") end
-end)
-
-Toggle(N2ActGroup, "AutoEscapeSnatch", {
-    Text = "Auto Escape Snatch",
-    Default = false,
-    Tooltip = "Spams EscapeSnatch whenever you stop being able to move",
-    Callback = function(state)
-        if not state then return end
-        spawnSafe(function()
-            while tog("AutoEscapeSnatch") do
-                local hum = Char.humanoid()
-                if hum and (hum.PlatformStand or hum.WalkSpeed == 0) then
-                    fireRemote("EscapeSnatch")
-                    task.wait(0.2)
+    Toggle(N2ActGroup, "AutoEscapeSnatch", {
+        Text = "Auto Escape Snatch",
+        Default = false,
+        Tooltip = "Spams EscapeSnatch whenever you stop being able to move",
+        Callback = function(state)
+            if not state then return end
+            spawnSafe(function()
+                while tog("AutoEscapeSnatch") do
+                    local hum = Char.humanoid()
+                    if hum and (hum.PlatformStand or hum.WalkSpeed == 0) then
+                        fireRemote("EscapeSnatch")
+                        task.wait(0.2)
+                    end
+                    task.wait(0.3)
                 end
-                task.wait(0.3)
-            end
-        end, "Auto escape")
-    end,
-})
+            end, "Auto escape")
+        end,
+    })
+end
 
 local BUNKER_FUEL_NAMES = { JerryCan = true, Gasoline = true, Fuel = true }
 local BUNKER_GEN_NAMES  = { Generator = true, Gen = true }
