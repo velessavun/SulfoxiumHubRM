@@ -38,6 +38,10 @@ local CONFIG = {
     DEFAULT_SPRINT_SPEED = 17,
     INF_VALUE            = 1e6,
     SURVIVAL_INTERVAL    = 1,
+    -- Were sliders on the Bunker tab. Six attempts lets one run walk every can
+    -- spot in the map before giving up.
+    REFILL_TIMEOUT       = 3,
+    REFILL_CAN_ATTEMPTS  = 6,
     PROMPT_INTERVAL      = 0.25,
     THREAT_INTERVAL      = 0.25,
     SETTINGS_FOLDER      = "SulfoxiumHubSettings",
@@ -1921,14 +1925,25 @@ local ESP = {
 }
 
 local ESP_NAME_CATEGORIES = {}
+local ESP_PATTERN_CATEGORIES = {}
 
 -- Anything sitting inside an object that is already highlighted is a duplicate
 -- of it: a handle inside its own model, a frame part inside the bed it belongs
--- to, a gauge part inside the generator.
+-- to, a gauge part inside the generator. Word matches count as well, otherwise
+-- every plank of a bed frame would get its own outline.
 local function notNestedInMatch(inst)
     local parent = inst.Parent
     while parent and parent ~= Workspace do
         if ESP_NAME_CATEGORIES[parent.Name] then return false end
+
+        local lowerName
+        for _, cat in ipairs(ESP_PATTERN_CATEGORIES) do
+            lowerName = lowerName or parent.Name:lower()
+            for _, word in ipairs(cat.patterns) do
+                if lowerName:find(word, 1, true) then return false end
+            end
+        end
+
         parent = parent.Parent
     end
     return true
@@ -1949,7 +1964,11 @@ local ESP_CATEGORIES = {
     -- Wood and Log used to live here: they are not pickups, and bed frames are
     -- built out of parts using those names, which is why beds lit up too.
     { key = "Items", text = "Items / Pickups", default = Color3.fromRGB(255, 255, 120), names = { Battery = true, Flashlight = true, Medkit = true, Bandage = true, Key = true, Keycard = true, Marshmallow = true }, filter = notNestedInMatch },
-    { key = "Beds", text = "Beds", default = Color3.fromRGB(120, 200, 255), names = { Bed = true, Beds = true, BunkBed = true, Bunk = true }, filter = notNestedInMatch },
+    -- Beds are named inconsistently from map to map — the Bunker's did not match
+    -- any exact spelling — so this one matches on the word instead. "bedroom" is
+    -- excluded so a whole room does not light up.
+    { key = "Beds", text = "Beds", default = Color3.fromRGB(120, 200, 255), names = { Bed = true, Beds = true, BunkBed = true, Bunk = true },
+      patterns = { "bed", "bunk" }, excludes = { "bedroom" }, filter = notNestedInMatch },
 }
 
 local THREAT_KEYS = { Larry = true, Stalker = true, Zombies = true, Abomination = true, Monster = true }
@@ -1968,6 +1987,15 @@ for _, cat in ipairs(ESP_CATEGORIES) do
                 ESP_NAME_CATEGORIES[name] = { cat }
             end
         end
+    end
+end
+
+-- Categories that also match on a word inside the name. Kept as its own short
+-- list so the sweep only pays for the lowercase conversion when one of them is
+-- actually switched on.
+for _, cat in ipairs(ESP_CATEGORIES) do
+    if cat.patterns then
+        table.insert(ESP_PATTERN_CATEGORIES, cat)
     end
 end
 
@@ -2055,16 +2083,43 @@ local function addEspEntry(inst, key, label, colorOverride)
     ESP.active[inst] = makeEspEntry(inst, key, label, colorOverride)
 end
 
+local function matchesPattern(cat, lowerName)
+    for _, word in ipairs(cat.excludes or {}) do
+        if lowerName:find(word, 1, true) then return false end
+    end
+    for _, word in ipairs(cat.patterns) do
+        if lowerName:find(word, 1, true) then return true end
+    end
+    return false
+end
+
 local function categoryFor(inst)
     -- Name first: it rejects almost every instance for the price of one lookup,
     -- where IsA is a call into the engine for each of the two class tests.
     local claimed = ESP_NAME_CATEGORIES[inst.Name]
-    if not claimed then return nil end
-    if not inst:IsA("Model") and not inst:IsA("BasePart") then return nil end
 
-    for _, cat in ipairs(claimed) do
-        if ESP.enabled[cat.key] and (not cat.filter or cat.filter(inst)) then
-            return cat.key
+    if claimed then
+        if not inst:IsA("Model") and not inst:IsA("BasePart") then return nil end
+
+        for _, cat in ipairs(claimed) do
+            if ESP.enabled[cat.key] and (not cat.filter or cat.filter(inst)) then
+                return cat.key
+            end
+        end
+        return nil
+    end
+
+    -- Word matching, only for the categories that asked for it and only while
+    -- one of them is switched on, so the usual sweep pays nothing for this.
+    local lowerName
+    for _, cat in ipairs(ESP_PATTERN_CATEGORIES) do
+        if ESP.enabled[cat.key] then
+            lowerName = lowerName or inst.Name:lower()
+            if matchesPattern(cat, lowerName)
+                and (inst:IsA("Model") or inst:IsA("BasePart"))
+                and (not cat.filter or cat.filter(inst)) then
+                return cat.key
+            end
         end
     end
     return nil
@@ -3585,10 +3640,6 @@ local function pickCan()
     end
     if #list == 0 then return nil end
 
-    if tog("RandomCan") then
-        return list[math.random(1, #list)]
-    end
-
     table.sort(list, function(a, b) return a.distance < b.distance end)
     return list[1]
 end
@@ -3604,10 +3655,12 @@ local function findNamedGenerator()
     return nil
 end
 
+-- Exactly at the centre of the generator, not hovering over it: standing on top
+-- put the character out of range of whatever the refill actually reacts to.
 local function generatorSpotCF(gen)
     local part = mainPartOf(gen)
     if not part then return nil, nil end
-    return CFrame.new(part.Position + Vector3.new(0, 3, 0)), part
+    return CFrame.new(part.Position), part
 end
 
 local refillBusy = false
@@ -3629,7 +3682,7 @@ local function refillGeneratorRoutine()
     end
 
     local origin = root.CFrame
-    local timeout = opt("RefillTimeout", 3)
+    local timeout = CONFIG.REFILL_TIMEOUT
 
     refillBusy = true
     Collision.acquire("refill")
@@ -3641,7 +3694,7 @@ local function refillGeneratorRoutine()
     local ok, err = pcall(function()
         local fuel = fuelInInventory()
 
-        while not fuel and tried < opt("CanAttempts", 6) do
+        while not fuel and tried < CONFIG.REFILL_CAN_ATTEMPTS do
             local candidate = pickCan()
             if not candidate then
                 stage = "nocan"
@@ -3654,13 +3707,13 @@ local function refillGeneratorRoutine()
             local canPosition = candidate.part.Position
             local before = toolSnapshot()
 
-            character:PivotTo(CFrame.new(canPosition + Vector3.new(0, 3, 0)))
+            character:PivotTo(CFrame.new(canPosition))
             zeroVelocity(root)
 
             actUntil(function()
                 local part = candidate.part
                 local livePosition = (part and part.Parent) and part.Position or canPosition
-                root.CFrame = CFrame.new(livePosition + Vector3.new(0, 3, 0))
+                root.CFrame = CFrame.new(livePosition)
                 zeroVelocity(root)
                 interact(candidate.inst)
             end, function()
@@ -3684,7 +3737,7 @@ local function refillGeneratorRoutine()
         zeroVelocity(root)
 
         local emptied = actUntil(function()
-            root.CFrame = CFrame.new(generatorPart.Position + Vector3.new(0, 3, 0))
+            root.CFrame = CFrame.new(generatorPart.Position)
             zeroVelocity(root)
             fireGenerators({ generator }, fuelInInventory())
         end, function()
@@ -3727,60 +3780,6 @@ Button(BunkerActGroup, "Refill Generator", "TP to a can, grab it, TP to the Gene
     local ok, message = refillGeneratorRoutine()
     notify(message, ok and 4 or 6)
 end)
-
-BunkerActGroup:AddSlider("RefillTimeout", {
-    Text = "Per-step timeout",
-    Default = 3,
-    Min = 0.5,
-    Max = 10,
-    Rounding = 1,
-    Suffix = "s",
-    Tooltip = "How long each stage (pickup, refill) may take before giving up",
-})
-
-BunkerActGroup:AddSlider("CanAttempts", {
-    Text = "Cans to try per run",
-    Default = 6,
-    Min = 1,
-    Max = 12,
-    Rounding = 0,
-    Tooltip = "The Bunker has 6 cans, so 6 lets one run walk every spot before giving up",
-})
-
-Toggle(BunkerActGroup, "RandomCan", {
-    Text = "Random can order",
-    Default = false,
-    Tooltip = "Off: always walks to the nearest untried can. On: picks one at random",
-})
-
-Button(BunkerActGroup, "Forget Taken Cans", "Clears the memory of which cans were already collected", function()
-    usedCans = setmetatable({}, { __mode = "k" })
-    notify("Can memory cleared — every JerryCan is a target again.")
-end)
-
-Toggle(BunkerActGroup, "AutoBunkerFuel", {
-    Text = "Auto Refuel Generator",
-    Default = false,
-    Tooltip = "Repeats the refuel routine on a timer",
-    Callback = function(state)
-        if not state then return end
-        spawnSafe(function()
-            while tog("AutoBunkerFuel") do
-                pcall(refillGeneratorRoutine)
-                task.wait(opt("AutoFuelDelay", 60))
-            end
-        end, "Auto refuel")
-    end,
-})
-
-BunkerActGroup:AddSlider("AutoFuelDelay", {
-    Text = "Refuel interval",
-    Default = 60,
-    Min = 15,
-    Max = 240,
-    Rounding = 0,
-    Suffix = "s",
-})
 
 local function findVents()
     local vents = {}
@@ -3829,9 +3828,8 @@ Button(BunkerActGroup, "Fix Ventilation", "Teleports to the vent and snaps back 
         return true
     end, opt("VentTimeout", 6))
 
-    if fixed then
-        notify(("Ventilation fixed in %d attempt(s) — returned instantly."):format(attempts))
-    else
+    -- Success is silent; only a vent that would not go quiet is worth saying.
+    if not fixed then
         notify(("Vent still has %d live trigger(s) after %ds — returned anyway.")
             :format(triggersLive(triggers), opt("VentTimeout", 6)), 6)
     end
@@ -3845,23 +3843,6 @@ BunkerActGroup:AddSlider("VentTimeout", {
     Rounding = 0,
     Suffix = "s",
 })
-
-Button(BunkerActGroup, "Collect Nearby Items", "Fires every prompt and click detector within range", function()
-    local root = Char.root()
-    if not root then return notify("Character not ready.") end
-    local range = opt("PromptRange", 18)
-    local count = 0
-    for _, inst in ipairs(Workspace:GetDescendants()) do
-        if inst:IsA("ProximityPrompt") or inst:IsA("ClickDetector") then
-            local parent = inst.Parent
-            local pos = parent and worldPosition(parent)
-            if pos and (pos - root.Position).Magnitude <= range then
-                if interact(inst) then count += 1 end
-            end
-        end
-    end
-    notify(("Fired %d interaction(s)."):format(count))
-end)
 
 -- Night 3 --------------------------------------------------------------------
 -- Anything added to NIGHT3_SPOTS above turns into a teleport button in the
