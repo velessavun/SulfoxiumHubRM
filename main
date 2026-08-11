@@ -3844,35 +3844,65 @@ do
         return fuel, fuelMax, running
     end
 
+    -- Games usually already draw the fuel somewhere on the generator itself, so
+    -- if there is no number to read, its own readout is the next best source.
+    local function readLabelText(gen)
+        for _, child in ipairs(gen:GetDescendants()) do
+            if (child:IsA("TextLabel") or child:IsA("TextButton")) and child.Text:find("%d") then
+                return child.Text
+            end
+        end
+        return nil
+    end
+
+    local dumped = false
+
+    -- Printed once so the real names are known if nothing above matched.
+    local function dumpSources(gen)
+        if dumped then return end
+        dumped = true
+
+        warn("[Sulfoxium Hub] no fuel value found on " .. gen:GetFullName() .. ". It holds:")
+        for name, value in pairs(gen:GetAttributes()) do
+            warn(("    attribute %s = %s (%s)"):format(name, tostring(value), typeof(value)))
+        end
+        for _, child in ipairs(gen:GetDescendants()) do
+            if child:IsA("ValueBase") then
+                warn(("    %s %s = %s"):format(child.ClassName, child.Name, tostring(child.Value)))
+            elseif child:IsA("TextLabel") or child:IsA("TextButton") then
+                warn(("    %s %s text = %s"):format(child.ClassName, child.Name, tostring(child.Text)))
+            end
+        end
+    end
+
     local function statusText()
         local gen = generator()
         if not gen then return "Generator: not found" end
 
         local fuel, fuelMax, running = readStatus(gen)
-        local bits = {}
 
+        -- The number itself, not a percentage: 47/100 says how much is left and
+        -- how far off empty you are at a glance.
+        local reading
         if fuel then
             if fuelMax and fuelMax > 0 then
-                table.insert(bits, ("fuel %d%%"):format(math.clamp(math.floor(fuel / fuelMax * 100), 0, 100)))
+                reading = ("%d/%d fuel"):format(math.floor(fuel + 0.5), math.floor(fuelMax + 0.5))
             else
-                table.insert(bits, ("fuel %.1f"):format(fuel))
+                reading = ("%d fuel"):format(math.floor(fuel + 0.5))
+            end
+        else
+            reading = readLabelText(gen)
+            if not reading then
+                dumpSources(gen)
+                return "Generator: found, but no fuel value to read"
             end
         end
 
         if running ~= nil then
-            table.insert(bits, running and "running" or "off")
+            reading = reading .. (running and "  |  running" or "  |  off")
         end
 
-        local root = Char.root()
-        local pos = root and worldPosition(gen)
-        if pos then
-            table.insert(bits, ("%dm away"):format(math.floor((pos - root.Position).Magnitude)))
-        end
-
-        if #bits == 0 then
-            return "Generator: found, no readable status"
-        end
-        return "Generator: " .. table.concat(bits, "  |  ")
+        return "Generator: " .. reading
     end
 
     Master:Add(RunService.Heartbeat:Connect(function(dt)
