@@ -145,6 +145,9 @@ local function destroyItem(item)
         if item.Clean then
             pcall(function() item:Clean() end)
         elseif item.Remove then
+            -- Drawing objects: hide first, since a failed removal would
+            -- otherwise leave them on screen with nothing referencing them.
+            pcall(function() item.Visible = false end)
             pcall(function() item:Remove() end)
         end
     end
@@ -1103,7 +1106,6 @@ local BypassGroup   = Tabs.Main:AddRightGroupbox("Bypass & Automation")
 local UtilityGroup  = Tabs.Main:AddRightGroupbox("Utility")
 
 local ESPGroup      = Tabs.Visuals:AddLeftGroupbox("ESP")
-local LightingGroup = Tabs.Visuals:AddRightGroupbox("Lighting")
 local CameraGroup   = Tabs.Visuals:AddRightGroupbox("Camera")
 
 local N1TPGroup  = Tabs.Night1:AddLeftGroupbox("Teleports")
@@ -1918,6 +1920,12 @@ UtilityGroup:AddLabel(("  mousemoverel: %s"):format(Exec.hasMouse and "yes" or "
 UtilityGroup:AddLabel(("  Drawing API: %s"):format(DrawingLib and "yes" or "NO"))
 UtilityGroup:AddLabel(("  File system: %s"):format(Exec.hasFiles and "yes" or "NO"))
 
+-- Every tracer line ever created, whether or not an entry still owns it. The
+-- render pass hides all of these at the start of each frame and only valid
+-- targets switch theirs back on, so a line cannot outlive its target no matter
+-- which teardown path failed to run.
+local ESP_TRACERS = {}
+
 local ESP = {
     active  = {},
     enabled = {},
@@ -1949,6 +1957,34 @@ local function notNestedInMatch(inst)
     return true
 end
 
+-- Answers the same question the Night 3 teleport does: is this can still there
+-- to collect? Written self-contained because the Bunker helpers it mirrors are
+-- defined much further down the file.
+local function isLiveJerryCan(inst)
+    -- Someone is carrying it.
+    if inst:FindFirstAncestorOfClass("Backpack") then return false end
+    local model = inst:FindFirstAncestorOfClass("Model")
+    while model do
+        if model:FindFirstChildOfClass("Humanoid") then return false end
+        model = model:FindFirstAncestorOfClass("Model")
+    end
+
+    -- The cans under Cabins are scenery and never collectable.
+    local parent = inst.Parent
+    while parent and parent ~= Workspace do
+        if parent.Name == "Cabins" then return false end
+        parent = parent.Parent
+    end
+
+    -- An empty spawn point keeps an invisible placeholder; one that actually
+    -- spawned has a part you can see.
+    if inst:IsA("BasePart") then return inst.Transparency < 1 end
+    for _, part in ipairs(inst:GetDescendants()) do
+        if part:IsA("BasePart") and part.Transparency < 1 then return true end
+    end
+    return false
+end
+
 local ESP_CATEGORIES = {
     { key = "Players", text = "Players", default = Color3.fromRGB(80, 140, 255) },
     { key = "Larry", text = "Larry (Mutant)", default = Color3.fromRGB(255, 60, 60), names = { Mutant = true } },
@@ -1961,6 +1997,9 @@ local ESP_CATEGORIES = {
     { key = "Fuel", text = "Fuel / JerryCan", default = Color3.fromRGB(0, 255, 120), names = { JerryCan = true, Gasoline = true, Fuel = true }, hideIn = { [NIGHT3_PLACE_ID] = true } },
     { key = "Monster", text = "Mutant Worker", default = Color3.fromRGB(255, 80, 0), names = { Mutant = true, Worker = true }, tab = "Night3" },
     { key = "WorkerHead", text = "WorkerHead", default = Color3.fromRGB(255, 230, 0), names = { WorkerHead = true }, tab = "Night3" },
+    -- Night 3's own can ESP: only ones that have actually spawned and are still
+    -- there, which is why the Fuel category above is hidden in that place.
+    { key = "JerryCan", text = "JerryCan", default = Color3.fromRGB(0, 255, 120), names = { JerryCan = true }, tab = "Night3", filter = isLiveJerryCan },
     -- Wood and Log used to live here: they are not pickups, and bed frames are
     -- built out of parts using those names, which is why beds lit up too.
     { key = "Items", text = "Items / Pickups", default = Color3.fromRGB(255, 255, 120), names = { Battery = true, Flashlight = true, Medkit = true, Bandage = true, Key = true, Keycard = true, Marshmallow = true }, filter = notNestedInMatch },
@@ -1993,7 +2032,9 @@ end
 -- Categories that also match on a word inside the name. Kept as its own short
 -- list so the sweep only pays for the lowercase conversion when one of them is
 -- actually switched on.
+local ESP_CATEGORY_BY_KEY = {}
 for _, cat in ipairs(ESP_CATEGORIES) do
+    ESP_CATEGORY_BY_KEY[cat.key] = cat
     if cat.patterns then
         table.insert(ESP_PATTERN_CATEGORIES, cat)
     end
@@ -2018,15 +2059,29 @@ local function makeEspEntry(inst, key, label, colorOverride)
     highlight.Name = "RMx_ESP"
     highlight.Adornee = inst
     highlight.FillColor = color
-    highlight.OutlineColor = Color3.new(1, 1, 1)
     highlight.FillTransparency = 0.6
-    highlight.OutlineTransparency = 0
+    -- No outline at all: a fully transparent one leaves just the coloured fill,
+    -- which reads far cleaner than the white edge that used to ring everything.
+    highlight.OutlineTransparency = 1
     highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
     highlight.Parent = hiddenUI
 
-    local adornPart = inst:IsA("Model")
-        and (inst:FindFirstChild("Head") or inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart"))
-        or inst
+    -- Written out rather than as an and/or chain: when a Model had no Head, no
+    -- PrimaryPart and no BasePart directly under it, that chain fell through to
+    -- the Model itself, and reading .Position off a Model throws. The search is
+    -- recursive now too, since a model like itemspots.spot.battery keeps its
+    -- parts a level or two down.
+    local adornPart
+    if inst:IsA("BasePart") then
+        adornPart = inst
+    elseif inst:IsA("Model") then
+        local head = inst:FindFirstChild("Head")
+        if head and head:IsA("BasePart") then
+            adornPart = head
+        else
+            adornPart = inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
+        end
+    end
 
     local billboard, textLabel
     if adornPart and adornPart:IsA("BasePart") then
@@ -2064,10 +2119,20 @@ local function makeEspEntry(inst, key, label, colorOverride)
 end
 
 local function destroyTracer(entry)
-    if entry.tracer then
-        pcall(function() entry.tracer:Remove() end)
-        entry.tracer = nil
+    local tracer = entry.tracer
+    if not tracer then return end
+    entry.tracer = nil
+
+    -- Hidden before it is removed, and never only removed: dropping the
+    -- reference after a failed :Remove() would leave the line drawn with
+    -- nothing left to hide it.
+    pcall(function() tracer.Visible = false end)
+
+    if not pcall(function() tracer:Remove() end) then
+        pcall(function() tracer:Destroy() end)
     end
+
+    ESP_TRACERS[tracer] = nil
 end
 
 local function removeEspEntry(inst)
@@ -2140,7 +2205,14 @@ local function sweepPlayers()
     for _, plr in ipairs(Players:GetPlayers()) do
         local char = plr.Character
         if char and not ESP.active[char] then
-            addEspEntry(char, "Players", plr.Name, plr == LocalPlayer and SELF_ESP_COLOR or nil)
+            local isSelf = plr == LocalPlayer
+            addEspEntry(char, "Players", plr.Name, isSelf and SELF_ESP_COLOR or nil)
+
+            -- Marked so no tracer is drawn to your own character: the line would
+            -- run from the centre of the screen to your own head and twitch with
+            -- the idle animation.
+            local entry = ESP.active[char]
+            if entry then entry.isSelf = isSelf end
         end
     end
 end
@@ -2162,9 +2234,28 @@ local function sweepWorkspace()
     sweepPlayers()
 end
 
+-- Cheap enough to run ten times a second: one IsDescendantOf per entry, no
+-- filters and no Workspace walk. This is what catches a target that was deleted
+-- or moved out of the world, and takes its tracer and label with it.
+local function dropDeadEntries()
+    for inst in pairs(ESP.active) do
+        if not inst:IsDescendantOf(Workspace) then
+            removeEspEntry(inst)
+        end
+    end
+end
+
 local function pruneEsp()
     for inst, entry in pairs(ESP.active) do
-        if not inst.Parent or not ESP.enabled[entry.key] then
+        local cat = ESP_CATEGORY_BY_KEY[entry.key]
+
+        -- The filter is re-run, not just checked once at creation: a JerryCan
+        -- that has since been collected should lose its highlight.
+        local stale = not inst:IsDescendantOf(Workspace)
+            or not ESP.enabled[entry.key]
+            or (cat and cat.filter and not cat.filter(inst))
+
+        if stale then
             removeEspEntry(inst)
         end
     end
@@ -2185,6 +2276,13 @@ local function startEsp()
             if inst.Parent then considerInstance(inst) end
         end)
     end), "espAdded")
+
+    task.spawn(function()
+        while ESP.running do
+            pcall(dropDeadEntries)
+            task.wait(0.1)
+        end
+    end)
 
     task.spawn(function()
         while ESP.running do
@@ -2210,6 +2308,17 @@ local function startEsp()
         local doLabels = accumulator >= CONFIG.ESP_LABEL_INTERVAL
         if doLabels then accumulator = 0 end
 
+        -- Every line starts this frame hidden. Only a target that is still in
+        -- the world and in range switches its own back on below, so a line left
+        -- behind by a deleted target simply never comes back. This runs before
+        -- any early return, so dying or losing the camera cannot freeze one
+        -- on screen either.
+        for drawing in pairs(ESP_TRACERS) do
+            if not pcall(function() drawing.Visible = false end) then
+                ESP_TRACERS[drawing] = nil
+            end
+        end
+
         -- With tracers off there is nothing to do on the frames between label
         -- updates, so do not walk the entry list on them at all.
         if not doLabels and not tracersOn then return end
@@ -2223,11 +2332,24 @@ local function startEsp()
         -- in first person, rather than from the bottom edge.
         local viewport = camera and camera.ViewportSize
         local tracerOrigin = viewport and Vector2.new(viewport.X / 2, viewport.Y / 2)
+
+        -- A target just off the edge projects to a coordinate a little outside
+        -- the viewport, which is what lets the line keep pointing at it. One
+        -- near the edge of the frustum can project to an enormous number, so the
+        -- endpoint is bounded to keep the line sane.
+        local limitX = viewport and viewport.X * 3 or 6000
+        local limitY = viewport and viewport.Y * 3 or 6000
         local closestName, closestDistance = nil, math.huge
 
         for inst, entry in pairs(ESP.active) do
             local part = entry.adornPart
-            if part and part.Parent then
+
+            -- Descendant of Workspace, not merely "has a parent". A destroyed
+            -- model leaves its parts parented to the dead model, and a monster
+            -- removed by reparenting keeps a parent too — in both cases the old
+            -- check saw it as alive and kept redrawing the line at its last
+            -- position. IsDescendantOf is false for both.
+            if part and inst:IsDescendantOf(Workspace) and part:IsDescendantOf(Workspace) then
                 local distance = (part.Position - origin).Magnitude
                 local visible = distance <= maxDistance
 
@@ -2243,35 +2365,55 @@ local function startEsp()
                             if entry.humanoid and entry.humanoid.Parent then
                                 suffix = (" | %d HP"):format(math.floor(entry.humanoid.Health))
                             end
-                            entry.text.Text = ("%s  [%dm]%s"):format(entry.label, math.floor(distance), suffix)
+                            entry.text.Text = ("%s  [%.2fm]%s"):format(entry.label, distance, suffix)
                         end
                     end
                 end
 
-                if tracersOn and visible then
-                    if not entry.tracer then
+                if tracersOn and visible and not entry.isSelf then
+                    local tracer = entry.tracer
+
+                    if not tracer and not entry.tracerFailed then
                         local ok, line = pcall(function() return DrawingLib.new("Line") end)
                         if ok and line then
                             line.Thickness = opt("TracerThickness", 1)
                             line.Transparency = 1
                             line.Color = entry.color
+                            line.ZIndex = 1
                             entry.tracer = line
-                        end
-                    end
-                    local tracer = entry.tracer
-                    if tracer then
-                        local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
-                        if onScreen then
-                            tracer.From = tracerOrigin
-                            tracer.To = Vector2.new(screenPos.X, screenPos.Y)
-                            tracer.Visible = true
+                            tracer = line
+                            ESP_TRACERS[line] = true
                         else
-                            tracer.Visible = false
+                            -- Drawing is unavailable for this target; asking
+                            -- again every frame would only burn time.
+                            entry.tracerFailed = true
                         end
                     end
-                elseif entry.tracer then
-                    entry.tracer.Visible = false
+
+                    if tracer then
+                        local point = camera:WorldToViewportPoint(part.Position)
+
+                        -- Only the depth decides whether to draw. Behind the
+                        -- camera the projection mirrors, so a line drawn from it
+                        -- points at the opposite side of the screen — that was
+                        -- the one case worth hiding. Being off to the side is
+                        -- not: the line should keep pointing the way you need to
+                        -- turn, which is what it now does.
+                        if point.Z > 0 then
+                            tracer.From = tracerOrigin
+                            tracer.To = Vector2.new(
+                                math.clamp(point.X, -limitX, limitX),
+                                math.clamp(point.Y, -limitY, limitY)
+                            )
+                            tracer.Visible = true
+                        end
+                        -- No else: everything was hidden at the top of the frame.
+                    end
                 end
+            else
+                -- Target is gone: take the tracer and label with it this frame,
+                -- rather than leaving them frozen until the next prune.
+                removeEspEntry(inst)
             end
         end
 
@@ -2415,296 +2557,6 @@ Button(ESPGroup, "Clear All ESP", "Disables every ESP category", function()
     setToggle("ESPTracers", false)
     notify("ESP cleared.")
 end)
-
--- Scoped so its locals are released at the end of the block: the main chunk
--- is close to Luau's 200 simultaneous locals and this section holds fifteen.
-local restoreLighting
-
-do
-    -- Atmosphere and Sky have no Enabled property, so reading or writing it throws.
-    -- Only PostEffect subclasses (blur, colour correction, bloom, sun rays, depth of
-    -- field) can be switched off in place; those two get detached and put back.
-    local Effects = { detached = {} }
-
-    function Effects.detach(inst)
-        if not inst.Parent then return end
-        table.insert(Effects.detached, { inst = inst, parent = inst.Parent })
-        inst.Parent = nil
-    end
-
-    function Effects.restore()
-        for _, entry in ipairs(Effects.detached) do
-            pcall(function() entry.inst.Parent = entry.parent end)
-        end
-        Effects.detached = {}
-    end
-
-    function Effects.kill(inst, enabledStore)
-        if inst:IsA("PostEffect") then
-            if enabledStore and enabledStore[inst] == nil then
-                enabledStore[inst] = inst.Enabled
-            end
-            if inst.Enabled then inst.Enabled = false end
-        elseif inst:IsA("Atmosphere") or inst:IsA("Sky") then
-            Effects.detach(inst)
-        end
-    end
-
-    local LightingState = { snapshot = nil, effectStates = nil }
-
-    local LIGHTING_PROPS = {
-        "Brightness", "FogEnd", "FogStart", "GlobalShadows",
-        "Ambient", "OutdoorAmbient", "ShadowSoftness", "ExposureCompensation",
-    }
-
-    local function snapshotLighting()
-        if LightingState.snapshot then return end
-
-        local snap = {}
-        for _, prop in ipairs(LIGHTING_PROPS) do
-            local ok, value = pcall(function() return Lighting[prop] end)
-            if ok then snap[prop] = value end
-        end
-        LightingState.snapshot = snap
-
-        local states = {}
-        for _, child in ipairs(Lighting:GetChildren()) do
-            if child:IsA("PostEffect") then
-                states[child] = child.Enabled
-            end
-        end
-        LightingState.effectStates = states
-    end
-
-    local function suppressEffects()
-        for _, child in ipairs(Lighting:GetChildren()) do
-            Effects.kill(child, LightingState.effectStates)
-        end
-        local gui = LocalPlayer:FindFirstChild("PlayerGui")
-        if gui then
-            for _, obj in ipairs(gui:GetDescendants()) do
-                if obj:IsA("BlurEffect") then obj.Enabled = false end
-            end
-        end
-    end
-
-    local FULLBRIGHT_MAX = 6
-
-    local PURE_EFFECT_CLASSES = {
-        "BlurEffect", "ColorCorrectionEffect", "SunRaysEffect", "BloomEffect",
-        "DepthOfFieldEffect", "Atmosphere", "Sky",
-    }
-
-    local Pure = {
-        active  = false,
-        effects = setmetatable({}, { __mode = "k" }),
-        parts   = setmetatable({}, { __mode = "k" }),
-        lights  = setmetatable({}, { __mode = "k" }),
-        props   = nil,
-    }
-
-    local function isPureEffect(inst)
-        for _, className in ipairs(PURE_EFFECT_CLASSES) do
-            if inst:IsA(className) then return true end
-        end
-        return false
-    end
-
-    local function pureKillEffect(inst)
-        if not isPureEffect(inst) then return end
-        Effects.kill(inst, Pure.effects)
-    end
-
-    local function pureStripShadows(inst)
-        if inst:IsA("BasePart") then
-            if Pure.parts[inst] == nil then
-                Pure.parts[inst] = inst.CastShadow
-            end
-            if inst.CastShadow then inst.CastShadow = false end
-        elseif inst:IsA("Light") then
-            if Pure.lights[inst] == nil then
-                Pure.lights[inst] = inst.Shadows
-            end
-            if inst.Shadows then inst.Shadows = false end
-        end
-    end
-
-    local function pureSweep()
-        for _, container in ipairs({ Lighting, Workspace.CurrentCamera, LocalPlayer:FindFirstChild("PlayerGui") }) do
-            if container then
-                for _, inst in ipairs(container:GetDescendants()) do
-                    pureKillEffect(inst)
-                end
-            end
-        end
-        for _, inst in ipairs(Workspace:GetDescendants()) do
-            pureKillEffect(inst)
-            pureStripShadows(inst)
-        end
-    end
-
-    local function pureApplyProps()
-        Lighting.GlobalShadows = false
-        Lighting.ShadowSoftness = 0
-        Lighting.FogStart = 1e6
-        Lighting.FogEnd = 1e6
-        Lighting.Ambient = Color3.new(1, 1, 1)
-        Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
-        Lighting.ColorShift_Top = Color3.new(1, 1, 1)
-        Lighting.ColorShift_Bottom = Color3.new(1, 1, 1)
-        pcall(function() Lighting.EnvironmentDiffuseScale = 1 end)
-        pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
-        pcall(function() Lighting.ExposureCompensation = 0 end)
-    end
-
-    function Pure.enable()
-        if Pure.active then return end
-        Pure.active = true
-
-        Pure.props = {}
-        for _, prop in ipairs({ "ColorShift_Top", "ColorShift_Bottom", "EnvironmentDiffuseScale", "EnvironmentSpecularScale" }) do
-            local ok, value = pcall(function() return Lighting[prop] end)
-            if ok then Pure.props[prop] = value end
-        end
-
-        pureApplyProps()
-        pureSweep()
-
-        Master:Add(Workspace.DescendantAdded:Connect(function(inst)
-            if not Pure.active then return end
-            task.defer(function()
-                if not inst.Parent then return end
-                pureKillEffect(inst)
-                pureStripShadows(inst)
-            end)
-        end), "pureAdded")
-
-        Master:Add(Lighting.DescendantAdded:Connect(function(inst)
-            if not Pure.active then return end
-            task.defer(function()
-                if inst.Parent then pureKillEffect(inst) end
-            end)
-        end), "pureLighting")
-
-        local accumulator = 0
-        Master:Add(RunService.Heartbeat:Connect(function(dt)
-            if not Pure.active then return end
-            accumulator += dt
-            if accumulator < 2 then return end
-            accumulator = 0
-            pureApplyProps()
-            pureSweep()
-        end), "pureHold")
-    end
-
-    function Pure.disable()
-        if not Pure.active then return end
-        Pure.active = false
-
-        Master:Remove("pureAdded")
-        Master:Remove("pureLighting")
-        Master:Remove("pureHold")
-
-        Effects.restore()
-
-        for inst, wasEnabled in pairs(Pure.effects) do
-            if typeof(inst) == "Instance" and inst.Parent then
-                pcall(function() inst.Enabled = wasEnabled end)
-            end
-        end
-        for part, castShadow in pairs(Pure.parts) do
-            if typeof(part) == "Instance" and part.Parent then
-                pcall(function() part.CastShadow = castShadow end)
-            end
-        end
-        for light, shadows in pairs(Pure.lights) do
-            if typeof(light) == "Instance" and light.Parent then
-                pcall(function() light.Shadows = shadows end)
-            end
-        end
-        if Pure.props then
-            for prop, value in pairs(Pure.props) do
-                pcall(function() Lighting[prop] = value end)
-            end
-        end
-
-        Pure.effects = setmetatable({}, { __mode = "k" })
-        Pure.parts = setmetatable({}, { __mode = "k" })
-        Pure.lights = setmetatable({}, { __mode = "k" })
-        Pure.props = nil
-    end
-
-    local FULLBRIGHT_PROPS = {
-        Brightness = true, FogEnd = true, GlobalShadows = true,
-        Ambient = true, OutdoorAmbient = true, ShadowSoftness = true,
-    }
-
-    -- One setting, fully on: brightness at the top of the range and pure mode with
-    -- it, so every shadow, blur and post effect is stripped rather than dimmed.
-    local function applyFullbright()
-        Lighting.Brightness = FULLBRIGHT_MAX
-        Lighting.FogEnd = 1e6
-        Lighting.GlobalShadows = false
-        Lighting.Ambient = Color3.fromRGB(255, 255, 255)
-        Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
-        Lighting.ShadowSoftness = 0
-
-        Pure.enable()
-    end
-
-    function restoreLighting()
-        Pure.disable()
-        Effects.restore()
-        if not LightingState.snapshot then return end
-        for prop, value in pairs(LightingState.snapshot) do
-            pcall(function() Lighting[prop] = value end)
-        end
-        if LightingState.effectStates then
-            for effect, wasEnabled in pairs(LightingState.effectStates) do
-                if effect.Parent then
-                    pcall(function() effect.Enabled = wasEnabled end)
-                end
-            end
-        end
-        LightingState.snapshot = nil
-        LightingState.effectStates = nil
-    end
-
-    Toggle(LightingGroup, "Fullbright", {
-        Text = "Fullbright",
-        Default = false,
-        Tooltip = "Full brightness with every shadow, blur and post-effect stripped",
-        Callback = function(state)
-            if state then
-                snapshotLighting()
-                applyFullbright()
-                suppressEffects()
-
-                Master:Add(Lighting.Changed:Connect(function(property)
-                    if FULLBRIGHT_PROPS[property] and tog("Fullbright") then
-                        applyFullbright()
-                    end
-                end), "fbChanged")
-
-                Master:Add(Lighting.ChildAdded:Connect(function(child)
-                    if not tog("Fullbright") then return end
-                    task.defer(function()
-                        if child.Parent then
-                            Effects.kill(child, LightingState.effectStates)
-                        end
-                    end)
-                end), "fbChildAdded")
-
-                notify("Fullbright enabled.")
-            else
-                Master:Remove("fbChanged")
-                Master:Remove("fbChildAdded")
-                restoreLighting()
-                notify("Fullbright disabled.")
-            end
-        end,
-    })
-end
 
 local CameraState = { defaultMin = 0.5, defaultMax = 128 }
 
@@ -3061,6 +2913,74 @@ do
     end))
 end
 
+-- Shared by every night tab and the Bunker. Strips the sky and everything that
+-- tints or darkens the scene, then pins Lighting to a flat white with no
+-- shadows anywhere. Not reversible in-session: rejoin to get the map's own
+-- lighting back.
+local function makeSkyPureWhite()
+    local removed = 0
+
+    for _, inst in ipairs(Lighting:GetDescendants()) do
+        if inst:IsA("Sky") or inst:IsA("Atmosphere") or inst:IsA("Clouds") then
+            if pcall(function() inst:Destroy() end) then removed += 1 end
+        end
+    end
+
+    local terrain = Workspace:FindFirstChildOfClass("Terrain")
+    local clouds = terrain and terrain:FindFirstChildOfClass("Clouds")
+    if clouds and pcall(function() clouds:Destroy() end) then removed += 1 end
+
+    local white = Color3.new(1, 1, 1)
+
+    local function applyWhite()
+        Lighting.Ambient = white
+        Lighting.OutdoorAmbient = white
+        Lighting.ColorShift_Top = white
+        Lighting.ColorShift_Bottom = white
+        Lighting.FogColor = white
+
+        -- This is what actually makes the sky white. The skybox is drawn beyond
+        -- any finite FogEnd, so it renders as solid fog colour, while the range
+        -- starts thousands of studs out — far past anything you can walk to, so
+        -- the map itself is never fogged.
+        Lighting.FogStart = 2000
+        Lighting.FogEnd = 4000
+
+        Lighting.Brightness = 6
+        Lighting.ClockTime = 12
+        Lighting.GeographicLatitude = 0
+        Lighting.GlobalShadows = false
+        Lighting.ShadowSoftness = 0
+    end
+
+    pcall(applyWhite)
+    pcall(function() Lighting.ExposureCompensation = 0 end)
+    pcall(function() Lighting.EnvironmentDiffuseScale = 1 end)
+    pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
+
+    -- Held, because the game drives its own lighting as the night goes on and
+    -- would otherwise put the dark sky back.
+    local accumulator = 0
+    Master:Add(RunService.Heartbeat:Connect(function(dt)
+        accumulator += dt
+        if accumulator < 1 then return end
+        accumulator = 0
+        pcall(applyWhite)
+    end), "whiteSky")
+
+    -- Parts and lights stop casting shadows as well: a white sky alone still
+    -- leaves the map full of dark edges.
+    for _, inst in ipairs(Workspace:GetDescendants()) do
+        if inst:IsA("BasePart") then
+            if inst.CastShadow then inst.CastShadow = false end
+        elseif inst:IsA("Light") then
+            if inst.Shadows then inst.Shadows = false end
+        end
+    end
+
+    notify(("Sky whited out — %d sky object(s) removed, shadows off."):format(removed), 5)
+end
+
 -- Scoped: nothing here is used outside the Night 1 tab.
 do
     local WOODPILE_CF  = CFrame.new(-27.149, 8.7, -118.611)
@@ -3404,6 +3324,14 @@ do
         if not ok then error(err, 0) end
         notify("All cameras fixed.")
     end)
+
+    Button(N1ActGroup, "Remove Larry", "Fires the KillPlayer remote", function()
+        if fireRemote("KillPlayer") then notify("Larry removed.") end
+    end)
+
+    Button(N1ActGroup, "Make Sky Pure White", "Strips the sky and all shadows for maximum brightness", function()
+        makeSkyPureWhite()
+    end)
 end
 
 -- Scoped: nothing here is used outside the Night 2 tab.
@@ -3564,6 +3492,14 @@ do
             end, "Auto escape")
         end,
     })
+
+    Button(N2ActGroup, "Remove Larry And Stalker", "Fires the KillPlayer remote", function()
+        if fireRemote("KillPlayer") then notify("Larry and Stalker removed.") end
+    end)
+
+    Button(N2ActGroup, "Make Sky Pure White", "Strips the sky and all shadows for maximum brightness", function()
+        makeSkyPureWhite()
+    end)
 end
 
 local BUNKER_FUEL_NAMES = { JerryCan = true, Gasoline = true, Fuel = true }
@@ -3903,11 +3839,16 @@ do
         -- how far off empty you are at a glance.
         local reading
         if fuel then
-            if fuelMax and fuelMax > 0 then
-                reading = ("%d/%d fuel"):format(math.floor(fuel + 0.5), math.floor(fuelMax + 0.5))
-            else
-                reading = ("%d fuel"):format(math.floor(fuel + 0.5))
+            local maximum = fuelMax
+            if not maximum or maximum <= 0 then
+                -- No maximum is exposed anywhere on the generator, and the
+                -- game's fuel runs to 100, so that is the scale shown. It is
+                -- raised if a reading ever goes past it rather than printing
+                -- something like 150/100.
+                maximum = math.max(100, fuel)
             end
+
+            reading = ("%d/%d fuel"):format(math.floor(fuel + 0.5), math.floor(maximum + 0.5))
         else
             reading = readLabelText(gen)
             if not reading then
@@ -3948,6 +3889,14 @@ local function findVents()
     end
     return vents
 end
+
+Button(BunkerActGroup, "Remove BunkerRat", "Fires the KillPlayer remote", function()
+    if fireRemote("KillPlayer") then notify("BunkerRat removed.") end
+end)
+
+Button(BunkerActGroup, "Make Sky Pure White", "Strips the sky and all shadows for maximum brightness", function()
+    makeSkyPureWhite()
+end)
 
 Button(BunkerActGroup, "Fix Ventilation", "Teleports to the vent and snaps back the frame it is fixed", function()
     local vents = findVents()
@@ -4118,10 +4067,35 @@ do
 
     local SAFE_SPOT = Vector3.new(194.70, 38.70, -215.17)
 
+    Button(ActGroup, "Remove Mutant Worker", "Fires the KillPlayer remote", function()
+        if fireRemote("KillPlayer") then notify("Mutant Worker removed.") end
+    end)
+
+    Button(ActGroup, "Make Sky Pure White", "Strips the sky and all shadows for maximum brightness", function()
+        makeSkyPureWhite()
+    end)
+
     Button(ActGroup, "Teleport To Safe Spot", "Teleports you to 194.70, 38.70, -215.17", function()
-        local _, root = Char.require()
+        local char, root = Char.require()
+        local target = CFrame.new(SAFE_SPOT) * root.CFrame.Rotation
+
         pushPosition()
-        pivotTo(CFrame.new(SAFE_SPOT) * root.CFrame.Rotation)
+        char:PivotTo(target)
+        zeroVelocity(root)
+
+        -- A jump this far made in a single frame gets rubber-banded: the server
+        -- rejects the new position and drags you back a moment later, which is
+        -- the half-second round trip. Re-asserting the position for a short
+        -- while makes it stick, and the velocity is zeroed each time so nothing
+        -- carries you off the spot once the hold ends.
+        local deadline = os.clock() + 0.75
+        while os.clock() < deadline do
+            RunService.Heartbeat:Wait()
+            if not root.Parent then return end
+            root.CFrame = target
+            zeroVelocity(root)
+        end
+
         notify("Teleported to the safe spot. '< Return' brings you back.")
     end)
 
@@ -4241,8 +4215,6 @@ local function panic(reason)
         end
         char:SetAttribute("SprintSpeed", CONFIG.DEFAULT_SPRINT_SPEED)
     end
-
-    restoreLighting()
 
     local camera = Workspace.CurrentCamera
     if camera then
