@@ -3923,9 +3923,11 @@ do
         return "Generator: " .. reading
     end
 
+    -- Ten times a second. Cheap because the generator is cached and only its own
+    -- descendants are read, never the Workspace.
     Master:Add(RunService.Heartbeat:Connect(function(dt)
         accumulator += dt
-        if accumulator < 1 then return end
+        if accumulator < 0.1 then return end
         accumulator = 0
         setLabel(statusLabel, statusText())
     end))
