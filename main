@@ -2958,15 +2958,26 @@ local function makeSkyPureWhite()
     pcall(function() Lighting.EnvironmentDiffuseScale = 1 end)
     pcall(function() Lighting.EnvironmentSpecularScale = 0 end)
 
-    -- Held, because the game drives its own lighting as the night goes on and
-    -- would otherwise put the dark sky back.
-    local accumulator = 0
-    Master:Add(RunService.Heartbeat:Connect(function(dt)
-        accumulator += dt
-        if accumulator < 1 then return end
-        accumulator = 0
+    -- Held on RenderStepped, which runs immediately before the frame is drawn.
+    -- A once-a-second hold let the game's night transition render dark for up to
+    -- a second before being corrected, which is the flash. Re-asserting every
+    -- frame means the game's values never reach the screen at all. Writing a
+    -- property its existing value is free and fires no change events, so this
+    -- costs nothing on the frames where nothing moved.
+    Master:Add(RunService.RenderStepped:Connect(function()
         pcall(applyWhite)
     end), "whiteSky")
+
+    -- The night transition brings its own sky and atmosphere with it. Those are
+    -- taken out as they appear instead of being left to draw for a frame.
+    Master:Add(Lighting.ChildAdded:Connect(function(child)
+        task.defer(function()
+            if child.Parent
+                and (child:IsA("Sky") or child:IsA("Atmosphere") or child:IsA("Clouds")) then
+                pcall(function() child:Destroy() end)
+            end
+        end)
+    end), "whiteSkyGuard")
 
     -- Parts and lights stop casting shadows as well: a white sky alone still
     -- leaves the map full of dark edges.
