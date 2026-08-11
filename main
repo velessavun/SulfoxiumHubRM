@@ -3787,6 +3787,102 @@ local function refillGeneratorRoutine()
     return false, "Refill did not complete."
 end
 
+-- Read-only readout, refreshed on a timer. Scoped so its locals are released.
+do
+    local statusLabel = BunkerActGroup:AddLabel("Generator: checking...")
+
+    local FUEL_WORDS  = { "fuel", "power", "charge", "energy", "gas" }
+    local STATE_WORDS = { "on", "running", "active", "enabled", "started" }
+
+    local function matchesAny(lower, words)
+        for _, word in ipairs(words) do
+            if lower:find(word, 1, true) then return true end
+        end
+        return false
+    end
+
+    local cached, nextSearch, accumulator = nil, 0, 0
+
+    -- Finding it walks the whole Workspace, so once found it is kept, and a
+    -- fruitless search is not repeated every tick.
+    local function generator()
+        if cached and cached.Parent then return cached end
+        if os.clock() < nextSearch then return nil end
+        nextSearch = os.clock() + 5
+        cached = findNamedGenerator()
+        return cached
+    end
+
+    -- The generator's fuel could be an attribute or a value object and the name
+    -- varies, so anything numeric that reads like fuel counts, and anything
+    -- boolean that reads like a running flag gives the on/off state.
+    local function readStatus(gen)
+        local fuel, fuelMax, running
+
+        local function consider(name, value)
+            local lower = name:lower()
+            if typeof(value) == "number" then
+                if lower:find("max", 1, true) and matchesAny(lower, FUEL_WORDS) then
+                    fuelMax = fuelMax or value
+                elseif not fuel and matchesAny(lower, FUEL_WORDS) then
+                    fuel = value
+                end
+            elseif typeof(value) == "boolean" and running == nil and matchesAny(lower, STATE_WORDS) then
+                running = value
+            end
+        end
+
+        for name, value in pairs(gen:GetAttributes()) do
+            consider(name, value)
+        end
+        for _, child in ipairs(gen:GetDescendants()) do
+            if child:IsA("ValueBase") then
+                consider(child.Name, child.Value)
+            end
+        end
+
+        return fuel, fuelMax, running
+    end
+
+    local function statusText()
+        local gen = generator()
+        if not gen then return "Generator: not found" end
+
+        local fuel, fuelMax, running = readStatus(gen)
+        local bits = {}
+
+        if fuel then
+            if fuelMax and fuelMax > 0 then
+                table.insert(bits, ("fuel %d%%"):format(math.clamp(math.floor(fuel / fuelMax * 100), 0, 100)))
+            else
+                table.insert(bits, ("fuel %.1f"):format(fuel))
+            end
+        end
+
+        if running ~= nil then
+            table.insert(bits, running and "running" or "off")
+        end
+
+        local root = Char.root()
+        local pos = root and worldPosition(gen)
+        if pos then
+            table.insert(bits, ("%dm away"):format(math.floor((pos - root.Position).Magnitude)))
+        end
+
+        if #bits == 0 then
+            return "Generator: found, no readable status"
+        end
+        return "Generator: " .. table.concat(bits, "  |  ")
+    end
+
+    Master:Add(RunService.Heartbeat:Connect(function(dt)
+        accumulator += dt
+        if accumulator < 1 then return end
+        accumulator = 0
+        setLabel(statusLabel, statusText())
+    end))
+end
+
 Button(BunkerActGroup, "Refill Generator", "TP to a can, grab it, TP to the Generator, refill, return when the can is gone", function()
     pushPosition()
     local ok, message = refillGeneratorRoutine()
