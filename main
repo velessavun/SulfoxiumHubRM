@@ -189,28 +189,20 @@ end
 
 local Master = Janitor.new()
 
-local Rayfield
+local UI
 
 local function notify(text, duration)
     text = tostring(text)
 
-    -- Falls back to the console rather than vanishing: before Rayfield has
-    -- loaded there is nothing to draw on, and a notification that fails should
+    -- Falls back to the console rather than vanishing: before the interface is
+    -- built there is nothing to draw on, and a notification that fails should
     -- still leave a trace.
-    if not Rayfield or not Rayfield.Notify then
+    if not UI or not UI.notify then
         warn("[Sulfoxium Hub] " .. text)
         return
     end
 
-    local ok, err = pcall(function()
-        Rayfield:Notify({
-            Title = "Sulfoxium Hub",
-            Content = text,
-            Duration = duration or CONFIG.NOTIFY_TIME,
-            Image = 4483362458,
-        })
-    end)
-
+    local ok, err = pcall(UI.notify, text, duration or CONFIG.NOTIFY_TIME)
     if not ok then
         warn(("[Sulfoxium Hub] %s (notification failed: %s)"):format(text, tostring(err)))
     end
@@ -363,10 +355,28 @@ local function zeroVelocity(root)
     root.AssemblyAngularVelocity = Vector3.zero
 end
 
-local function pivotTo(cframe)
+-- Every teleport goes through here, and every one of them holds the position
+-- for a moment rather than setting it once.
+--
+-- A jump made in a single frame gets rubber-banded: the server sees one
+-- impossible step, rejects it, and drags the character back a fraction of a
+-- second later. That is the teleport that "sometimes" does not take, and the
+-- one that puts you back where you started. Re-asserting the position for a
+-- short while presents it as a settled position instead of a single jump, and
+-- zeroing the velocity each time stops momentum carrying you off the spot once
+-- the hold ends.
+local function pivotTo(cframe, holdFor)
     local char, root = Char.require()
     char:PivotTo(cframe)
     zeroVelocity(root)
+
+    local deadline = os.clock() + (holdFor or 0.4)
+    while os.clock() < deadline do
+        RunService.Heartbeat:Wait()
+        if not root.Parent then return end
+        root.CFrame = cframe
+        zeroVelocity(root)
+    end
 end
 
 local positionHistory = {}
@@ -688,75 +698,414 @@ local NIGHT3_SPOTS = {
 
 local BUNKER_GENERATOR_CF = CFrame.new(-31.4144745, 13.3999977, -155.574509, -0.00836277846, 1.05214681e-08, 0.999965012, 1.05635436e-07, 1, -9.63839941e-09, -0.999965012, 1.05634229e-07, -0.00836277846)
 
-Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
-
--- Rayfield has no flags you can read back by name and no left/right groupboxes.
--- These two registries and the group wrapper below keep the element API the rest
--- of the file was written against, so every feature carries over unchanged:
---   Toggles[id].Value / :SetValue(v)
---   Options[id].Value  (sliders, dropdowns, inputs, colour pickers)
+-- Interface ------------------------------------------------------------------
+-- Built here rather than pulled from a library. Everything below exposes the
+-- same element API the rest of the file was already written against, so no
+-- feature code changes:
+--   Toggles[id].Value / :SetValue(v)   Options[id].Value
+--   group:AddButton / AddToggle / AddSlider / AddDropdown / AddInput / AddLabel
 Toggles = {}
 Options = {}
 
--- Keybinds are handled with a plain input listener rather than Rayfield's
--- CreateKeybind. LoadConfiguration replays saved flags and fires their
--- callbacks, so a keybind bound to panic unloaded the whole menu the instant
--- the script finished loading — the loading screen, then nothing.
+-- Keybinds are a plain input listener, not UI elements.
 local KEYBINDS = {}
 local uiReady = false
 
-local Window = Rayfield:CreateWindow({
-    Name = ("Sulfoxium Hub — %s"):format(SUPPORTED_PLACES[game.PlaceId]),
-    Icon = 0,
-    LoadingTitle = "Sulfoxium Hub",
-    LoadingSubtitle = SUPPORTED_PLACES[game.PlaceId],
-    Theme = "Default",
+local SCRIPT_VERSION = "v3.0"
 
-    DisableRayfieldPrompts = false,
-    DisableBuildWarnings = false,
+local newTab
+do
+    local TweenService = game:GetService("TweenService")
+    local Stats = game:GetService("Stats")
 
-    ConfigurationSaving = {
-        Enabled = true,
-        FolderName = CONFIG.SETTINGS_FOLDER,
-        FileName = "Sulfoxium " .. tostring(game.PlaceId),
-    },
+    local THEME = {
+        black   = Color3.fromRGB(24, 12, 14),   -- the pane behind everything
+        panel   = Color3.fromRGB(38, 17, 20),   -- sidebar and content plates
+        row     = Color3.fromRGB(86, 26, 30),   -- maroon control plates
+        rowLit  = Color3.fromRGB(120, 32, 36),  -- maroon, hovered
+        accent  = Color3.fromRGB(205, 45, 48),  -- lettering and fills
+        border  = Color3.fromRGB(190, 40, 42),  -- the outline around it all
+        tabOn   = Color3.fromRGB(170, 38, 42),  -- the tab you are on
+        deep    = Color3.fromRGB(96, 26, 30),
+        text    = Color3.fromRGB(240, 235, 235),
+        dim     = Color3.fromRGB(132, 126, 126),
+    }
 
-    Discord = {
-        Enabled = false,
-        Invite = "noinvitelink",
-        RememberJoins = true,
-    },
+    local WINDOW = Vector2.new(800, 470)
+    local SIDEBAR = 200
 
-    KeySystem = false,
-})
-
-local TAB_ICON = 4483362458
-
--- Every element is created through here. Rayfield rejects option shapes that
--- Linoria ignored, and an error while building one element used to abort the
--- whole script before the window appeared — which is why nothing loaded. A
--- failed element is now skipped and named in the console instead.
-local function create(tab, kind, payload)
-    local builder = tab and tab["Create" .. kind]
-    if not builder then
-        warn(("[Sulfoxium Hub] Rayfield has no Create%s"):format(kind))
-        return nil
+    local function make(class, props, parent)
+        local inst = Instance.new(class)
+        for key, value in pairs(props or {}) do
+            inst[key] = value
+        end
+        if parent then inst.Parent = parent end
+        return inst
     end
 
-    local ok, element = pcall(builder, tab, payload)
-    if ok then return element end
+    local function round(inst, radius)
+        make("UICorner", { CornerRadius = UDim.new(0, radius or 8) }, inst)
+        return inst
+    end
 
-    warn(("[Sulfoxium Hub] Create%s failed for %s: %s")
-        :format(kind, tostring(typeof(payload) == "table" and payload.Name or payload), tostring(element)))
-    return nil
-end
+    local function edge(inst, color, transparency)
+        make("UIStroke", {
+            Color = color or THEME.deep,
+            Transparency = transparency or 0.4,
+            Thickness = 1,
+        }, inst)
+        return inst
+    end
 
--- Rayfield sections are plain headers: everything added after one belongs to it
--- until the next. The groupboxes are created up front but filled much later, so
--- a section is only emitted when its group first receives an element, and again
--- if another group interrupted it.
-local newGroup
-do
+    local function padding(inst, amount)
+        make("UIPadding", {
+            PaddingLeft = UDim.new(0, amount),
+            PaddingRight = UDim.new(0, amount),
+            PaddingTop = UDim.new(0, amount),
+            PaddingBottom = UDim.new(0, amount),
+        }, inst)
+        return inst
+    end
+
+    local function tween(inst, time, props)
+        local ok, animation = pcall(function()
+            return TweenService:Create(inst, TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), props)
+        end)
+        if ok and animation then animation:Play() end
+        return animation
+    end
+
+    -- Screen ------------------------------------------------------------------
+
+    local screen = make("ScreenGui", {
+        Name = "Sulfoxium Hub",
+        ResetOnSpawn = false,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+        DisplayOrder = 999,
+        IgnoreGuiInset = true,
+    }, hiddenUI)
+
+    -- Readouts down the right edge: version, executor, ping, fps top to bottom.
+    local hud = make("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -14, 0.5, 0),
+        Size = UDim2.new(0, 198, 0, 30 + 4 * 51 + 4 * 10),
+        BackgroundTransparency = 1,
+    }, screen)
+
+    make("UIListLayout", {
+        Padding = UDim.new(0, 10),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        HorizontalAlignment = Enum.HorizontalAlignment.Right,
+    }, hud)
+
+    local function hudBox(order)
+        -- No stroke on these: they read cleaner as plain plates.
+        local box = round(make("Frame", {
+            Size = UDim2.new(1, 0, 0, 51),
+            BackgroundColor3 = THEME.row,
+            BackgroundTransparency = 0.25,
+            LayoutOrder = order,
+        }, hud), 12)
+
+        return make("TextLabel", {
+            Size = UDim2.fromScale(1, 1),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold,
+            TextSize = 21,
+            TextColor3 = THEME.accent,
+            Text = "--",
+        }, box)
+    end
+
+    local hudTitle = make("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 30),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 22,
+        TextColor3 = THEME.text,
+        Text = "SULFOXIUM",
+        LayoutOrder = 0,
+    }, hud)
+
+    make("TextLabel", {
+        AnchorPoint = Vector2.new(0, 0),
+        Position = UDim2.new(1, 4, 0, 0),
+        Size = UDim2.fromOffset(60, 30),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 22,
+        TextColor3 = THEME.accent,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "HUB",
+    }, hudTitle)
+
+    local versionLabel  = hudBox(1)
+    local executorLabel = hudBox(2)
+    local pingLabel     = hudBox(3)
+    local fpsLabel      = hudBox(4)
+
+    versionLabel.Text = SCRIPT_VERSION
+
+    do
+        local name = "Unknown"
+        local ok, found = pcall(function()
+            if identifyexecutor then return identifyexecutor() end
+            if getexecutorname then return getexecutorname() end
+            return nil
+        end)
+        if ok and typeof(found) == "string" and found ~= "" then name = found end
+        executorLabel.Text = name
+    end
+
+    -- Window ------------------------------------------------------------------
+
+    local window = round(make("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(0, 0),
+        BackgroundColor3 = THEME.black,
+        BackgroundTransparency = 0.55,
+        Visible = false,
+        ClipsDescendants = true,
+    }, screen), 8)
+    make("UIStroke", { Color = THEME.border, Transparency = 0.1, Thickness = 2 }, window)
+
+    local titleBar = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 38),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.55,
+    }, window)
+    round(titleBar, 8)
+
+    make("TextLabel", {
+        Position = UDim2.fromOffset(16, 0),
+        Size = UDim2.new(0.6, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 19,
+        TextColor3 = THEME.accent,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "SULFOXIUM HUB",
+    }, titleBar)
+
+    make("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -16, 0, 0),
+        Size = UDim2.new(0, 90, 1, 0),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 16,
+        TextColor3 = THEME.accent,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Text = SCRIPT_VERSION,
+    }, titleBar)
+
+    -- Tab list down the left, content on the right.
+    local sidebar = make("ScrollingFrame", {
+        Position = UDim2.fromOffset(8, 42),
+        Size = UDim2.new(0, SIDEBAR, 1, -50),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.5,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 0,
+        CanvasSize = UDim2.new(),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    }, window)
+    round(sidebar, 6)
+    edge(sidebar, THEME.border, 0.45)
+    padding(sidebar, 5)
+    make("UIListLayout", { Padding = UDim.new(0, 15), SortOrder = Enum.SortOrder.LayoutOrder }, sidebar)
+
+    local contentHolder = make("Frame", {
+        Position = UDim2.fromOffset(SIDEBAR + 16, 42),
+        Size = UDim2.new(1, -(SIDEBAR + 24), 1, -50),
+        BackgroundColor3 = THEME.panel,
+        BackgroundTransparency = 0.6,
+    }, window)
+    round(contentHolder, 6)
+    edge(contentHolder, THEME.border, 0.45)
+
+    -- The reference puts the current section's name in red across the top of
+    -- the content pane; this is that line.
+    local contentHeader = make("TextLabel", {
+        Position = UDim2.fromOffset(0, 6),
+        Size = UDim2.new(1, 0, 0, 22),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 17,
+        TextColor3 = THEME.accent,
+        Text = "Select a tab",
+    }, contentHolder)
+
+    -- Dragging by the title bar.
+    do
+        local dragging, startPos, startInput
+        titleBar.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                startPos = window.Position
+                startInput = input.Position
+            end
+        end)
+
+        Master:Add(UserInputService.InputChanged:Connect(function(input)
+            if not dragging then return end
+            if input.UserInputType ~= Enum.UserInputType.MouseMovement
+                and input.UserInputType ~= Enum.UserInputType.Touch then return end
+            local delta = input.Position - startInput
+            window.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end))
+
+        Master:Add(UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end))
+    end
+
+    -- Show button and the pop animation ---------------------------------------
+
+    local shown = false
+
+    local showButton = round(make("TextButton", {
+        AnchorPoint = Vector2.new(0.5, 0),
+        -- Sits below the game's clock rather than beside it.
+        Position = UDim2.new(0.5, 0, 0, 92),
+        Size = UDim2.fromOffset(285, 51),
+        BackgroundColor3 = THEME.row,
+        BackgroundTransparency = 0.2,
+        Font = Enum.Font.GothamBold,
+        TextSize = 22,
+        TextColor3 = THEME.text,
+        Text = "Show Sulfoxium",
+        AutoButtonColor = false,
+    }, screen), 10)
+    edge(showButton, THEME.border, 0.35)
+
+    -- First person locks the cursor to the middle of the screen, which leaves
+    -- nothing to click the menu with. It is freed while the menu is open and put
+    -- back exactly as it was on close. The camera script re-locks it every frame
+    -- in first person, so this has to be re-asserted every frame to win.
+    local savedBehavior, savedIcon
+
+    local function freeCursor(free)
+        if free then
+            if savedBehavior == nil then
+                savedBehavior = UserInputService.MouseBehavior
+                savedIcon = UserInputService.MouseIconEnabled
+            end
+
+            Master:Add(RunService.RenderStepped:Connect(function()
+                -- Hold right mouse to look around. The camera takes the mouse
+                -- itself while you drag, and forcing it free every frame is what
+                -- stopped the view from turning, so the override stands down for
+                -- as long as the button is down and resumes the moment it is up.
+                local looking = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+
+                if not looking and UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
+                    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+                end
+
+                if not UserInputService.MouseIconEnabled then
+                    UserInputService.MouseIconEnabled = true
+                end
+            end), "freeCursor")
+        else
+            Master:Remove("freeCursor")
+            if savedBehavior ~= nil then
+                pcall(function() UserInputService.MouseBehavior = savedBehavior end)
+                pcall(function() UserInputService.MouseIconEnabled = savedIcon end)
+                savedBehavior, savedIcon = nil, nil
+            end
+        end
+    end
+
+    local function setShown(state)
+        shown = state
+        showButton.Text = state and "Hide Sulfoxium" or "Show Sulfoxium"
+        freeCursor(state)
+
+        if state then
+            window.Visible = true
+            window.Size = UDim2.fromOffset(0, 0)
+            -- Anchored at the centre, so growing the size opens it out from the
+            -- middle of the screen rather than from a corner.
+            tween(window, 0.22, { Size = UDim2.fromOffset(WINDOW.X, WINDOW.Y) })
+        else
+            local animation = tween(window, 0.18, { Size = UDim2.fromOffset(0, 0) })
+            if animation then
+                animation.Completed:Connect(function()
+                    if not shown then window.Visible = false end
+                end)
+            else
+                window.Visible = false
+            end
+        end
+    end
+
+    showButton.MouseButton1Click:Connect(function()
+        setShown(not shown)
+    end)
+
+    showButton.MouseEnter:Connect(function()
+        tween(showButton, 0.12, { BackgroundColor3 = THEME.rowLit })
+    end)
+    showButton.MouseLeave:Connect(function()
+        tween(showButton, 0.12, { BackgroundColor3 = THEME.row })
+    end)
+
+    -- Notifications -----------------------------------------------------------
+
+    local notifyHolder = make("Frame", {
+        AnchorPoint = Vector2.new(1, 1),
+        Position = UDim2.new(1, -14, 1, -14),
+        Size = UDim2.fromOffset(260, 300),
+        BackgroundTransparency = 1,
+    }, screen)
+
+    make("UIListLayout", {
+        Padding = UDim.new(0, 6),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        VerticalAlignment = Enum.VerticalAlignment.Bottom,
+        HorizontalAlignment = Enum.HorizontalAlignment.Right,
+    }, notifyHolder)
+
+    local function showNotification(text, duration)
+        local card = round(make("Frame", {
+            Size = UDim2.new(1, 0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundColor3 = THEME.panel,
+            BackgroundTransparency = 0.15,
+        }, notifyHolder), 10)
+        edge(card, THEME.accent, 0.45)
+        padding(card, 10)
+
+        make("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 0),
+            AutomaticSize = Enum.AutomaticSize.Y,
+            BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham,
+            TextSize = 16,
+            TextColor3 = THEME.text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextWrapped = true,
+            Text = text,
+        }, card)
+
+        task.delay(duration, function()
+            tween(card, 0.2, { BackgroundTransparency = 1 })
+            task.wait(0.22)
+            pcall(function() card:Destroy() end)
+        end)
+    end
+
+    -- Elements ----------------------------------------------------------------
+
     local function increment(rounding)
         if not rounding or rounding <= 0 then return 1 end
         return 1 / (10 ^ rounding)
@@ -772,19 +1121,123 @@ do
         return entry
     end
 
-    function newGroup(tab, state, title)
+    local function row(parent, height)
+        local frame = round(make("Frame", {
+            Size = UDim2.new(1, 0, 0, height or 38),
+            BackgroundColor3 = THEME.row,
+            BackgroundTransparency = 0.3,
+        }, parent), 8)
+        edge(frame, THEME.deep, 0.55)
+        return frame
+    end
+
+    local function rowLabel(parent, text, width)
+        return make("TextLabel", {
+            Position = UDim2.fromOffset(10, 0),
+            Size = width or UDim2.new(1, -20, 1, 0),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.Gotham,
+            TextSize = 16,
+            TextColor3 = THEME.text,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            Text = text,
+        }, parent)
+    end
+
+    -- A slider bar shared by the sliders and the colour picker channels.
+    local function bar(parent, position, size, min, max, rounding, initial, onChange)
+        local track = round(make("Frame", {
+            AnchorPoint = Vector2.new(0, 0.5),
+            Position = position,
+            Size = size,
+            BackgroundColor3 = THEME.black,
+            BackgroundTransparency = 0.2,
+        }, parent), 6)
+
+        local fill = round(make("Frame", {
+            Size = UDim2.fromScale(0, 1),
+            BackgroundColor3 = THEME.accent,
+            BorderSizePixel = 0,
+        }, track), 6)
+
+        local value = initial
+        local step = increment(rounding)
+
+        local function apply(newValue, fire)
+            value = math.clamp(newValue, min, max)
+            value = math.floor(value / step + 0.5) * step
+            local span = max - min
+            fill.Size = UDim2.fromScale(span > 0 and (value - min) / span or 0, 1)
+            if fire then onChange(value) end
+        end
+
+        apply(initial, false)
+
+        local dragging = false
+        local function fromInput(input)
+            if track.AbsoluteSize.X <= 0 then return end
+            local alpha = math.clamp((input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+            apply(min + (max - min) * alpha, true)
+        end
+
+        track.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                fromInput(input)
+            end
+        end)
+
+        Master:Add(UserInputService.InputChanged:Connect(function(input)
+            if not dragging then return end
+            if input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch then
+                fromInput(input)
+            end
+        end))
+
+        Master:Add(UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = false
+            end
+        end))
+
+        return { set = function(v) apply(v, false) end }
+    end
+
+    -- Groups ------------------------------------------------------------------
+
+    local function newGroup(page, state, title)
         local group = {}
 
         local function open()
-            if state.current ~= group then
-                state.current = group
-                create(tab, "Section", title)
-            end
+            if state.current == group then return end
+            state.current = group
+
+            local header = make("TextLabel", {
+                Size = UDim2.new(1, 0, 0, 24),
+                BackgroundTransparency = 1,
+                Font = Enum.Font.GothamBold,
+                TextSize = 16,
+                TextColor3 = THEME.accent,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                Text = string.upper(title),
+                LayoutOrder = state.order,
+            }, page)
+            state.order += 1
+            return header
+        end
+
+        local function place(inst)
+            inst.LayoutOrder = state.order
+            state.order += 1
+            inst.Parent = page
         end
 
         function group:AddButton(a, b)
             open()
-
             local text, func
             if typeof(a) == "table" then
                 text, func = a.Text, a.Func
@@ -792,61 +1245,167 @@ do
                 text, func = a, b
             end
 
-            local button = create(tab, "Button", { Name = text, Callback = func })
+            local button = round(make("TextButton", {
+                Size = UDim2.new(1, 0, 0, 38),
+                BackgroundColor3 = THEME.row,
+                BackgroundTransparency = 0.3,
+                Font = Enum.Font.Gotham,
+                TextSize = 16,
+                TextColor3 = THEME.text,
+                Text = text,
+                AutoButtonColor = false,
+            }), 8)
+            edge(button, THEME.deep, 0.55)
+            place(button)
+
+            button.MouseEnter:Connect(function()
+                tween(button, 0.1, { BackgroundColor3 = THEME.rowLit })
+            end)
+            button.MouseLeave:Connect(function()
+                tween(button, 0.1, { BackgroundColor3 = THEME.row })
+            end)
+            button.MouseButton1Click:Connect(function()
+                if func then task.spawn(func) end
+            end)
+
             return {
-                SetText = function(_, newText)
-                    if button then pcall(function() button:Set(newText) end) end
-                end,
+                SetText = function(_, newText) button.Text = newText end,
             }
         end
 
         function group:AddToggle(id, info)
             open()
-
             local entry = register(Toggles, id, info.Default == true)
 
-            local toggle = create(tab, "Toggle", {
-                Name = info.Text,
-                CurrentValue = info.Default == true,
-                Flag = id,
-                Callback = function(value)
-                    entry.Value = value
-                    if info.Callback then info.Callback(value) end
-                end,
-            })
+            local frame = row(page)
+            place(frame)
+            rowLabel(frame, info.Text, UDim2.new(1, -60, 1, 0))
 
-            entry.SetValue = function(_, value)
-                value = value == true
-                if toggle then
-                    pcall(function() toggle:Set(value) end)
+            local pill = round(make("Frame", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, -10, 0.5, 0),
+                Size = UDim2.fromOffset(42, 20),
+                BackgroundColor3 = THEME.black,
+                BackgroundTransparency = 0.2,
+            }, frame), 10)
+
+            local knob = round(make("Frame", {
+                AnchorPoint = Vector2.new(0, 0.5),
+                Position = UDim2.new(0, 2, 0.5, 0),
+                Size = UDim2.fromOffset(16, 16),
+                BackgroundColor3 = THEME.dim,
+            }, pill), 6)
+
+            local hit = make("TextButton", {
+                Size = UDim2.fromScale(1, 1),
+                BackgroundTransparency = 1,
+                Text = "",
+            }, frame)
+
+            local function paint()
+                if entry.Value then
+                    tween(knob, 0.12, { Position = UDim2.new(1, -18, 0.5, 0), BackgroundColor3 = THEME.text })
+                else
+                    tween(knob, 0.12, { Position = UDim2.new(0, 2, 0.5, 0), BackgroundColor3 = THEME.dim })
                 end
-                entry.Value = value
+            end
+            paint()
+
+            -- Fires the callback even when the value did not change: the script
+            -- switches some toggles to their existing default at startup to make
+            -- the feature attach itself, and swallowing that would leave Anti-AFK
+            -- and friends showing on but doing nothing.
+            local function set(value, fire)
+                value = value == true
+                if entry.Value ~= value then
+                    entry.Value = value
+                    paint()
+                end
+                if fire and info.Callback then task.spawn(info.Callback, value) end
             end
 
-            -- Linoria hung a key picker off every toggle; only the ones that
-            -- asked for a real key get a bind, and it lives in the input
-            -- listener rather than in a Rayfield element.
+            hit.MouseButton1Click:Connect(function()
+                set(not entry.Value, true)
+            end)
+
+            entry.SetValue = function(_, value) set(value, true) end
+
+            -- Only toggles that asked for a real key get a bind, and it lives in
+            -- the input listener rather than as an element.
             entry.AddKeyPicker = function(_, keyId, keyInfo)
                 local default = keyInfo and keyInfo.Default
                 if not default or default == "None" then return end
-
-                KEYBINDS[default] = function()
-                    entry:SetValue(not entry.Value)
-                end
+                KEYBINDS[default] = function() set(not entry.Value, true) end
             end
 
             entry.AddColorPicker = function(_, colorId, colorInfo)
                 local colorEntry = register(Options, colorId, colorInfo.Default)
 
-                create(tab, "ColorPicker", {
-                    Name = colorInfo.Title or colorId,
-                    Color = colorInfo.Default,
-                    Flag = colorId,
-                    Callback = function(value)
-                        colorEntry.Value = value
-                        if colorInfo.Callback then colorInfo.Callback(value) end
-                    end,
-                })
+                local pickerRow = row(page)
+                place(pickerRow)
+                rowLabel(pickerRow, colorInfo.Title or colorId, UDim2.new(1, -60, 1, 0))
+
+                local swatch = round(make("Frame", {
+                    AnchorPoint = Vector2.new(1, 0.5),
+                    Position = UDim2.new(1, -10, 0.5, 0),
+                    Size = UDim2.fromOffset(34, 16),
+                    BackgroundColor3 = colorInfo.Default,
+                }, pickerRow), 6)
+                edge(swatch, THEME.deep, 0.3)
+
+                local channels = make("Frame", {
+                    Size = UDim2.new(1, 0, 0, 66),
+                    BackgroundTransparency = 1,
+                    Visible = false,
+                }, page)
+                place(channels)
+
+                local rgb = { colorInfo.Default.R * 255, colorInfo.Default.G * 255, colorInfo.Default.B * 255 }
+
+                local function push()
+                    local color = Color3.fromRGB(rgb[1], rgb[2], rgb[3])
+                    swatch.BackgroundColor3 = color
+                    colorEntry.Value = color
+                    if colorInfo.Callback then task.spawn(colorInfo.Callback, color) end
+                end
+
+                for index, name in ipairs({ "R", "G", "B" }) do
+                    local line = make("Frame", {
+                        Position = UDim2.fromOffset(0, (index - 1) * 22),
+                        Size = UDim2.new(1, 0, 0, 20),
+                        BackgroundTransparency = 1,
+                    }, channels)
+
+                    make("TextLabel", {
+                        Size = UDim2.fromOffset(18, 20),
+                        BackgroundTransparency = 1,
+                        Font = Enum.Font.Gotham,
+                        TextSize = 12,
+                        TextColor3 = THEME.dim,
+                        Text = name,
+                    }, line)
+
+                    bar(line, UDim2.new(0, 22, 0.5, 0), UDim2.new(1, -32, 0, 8), 0, 255, 0, rgb[index], function(value)
+                        rgb[index] = value
+                        push()
+                    end)
+                end
+
+                colorEntry.SetValue = function(_, value)
+                    if typeof(value) ~= "Color3" then return end
+                    rgb = { value.R * 255, value.G * 255, value.B * 255 }
+                    push()
+                end
+
+                local swatchHit = make("TextButton", {
+                    Size = UDim2.fromScale(1, 1),
+                    BackgroundTransparency = 1,
+                    Text = "",
+                }, pickerRow)
+
+                swatchHit.MouseButton1Click:Connect(function()
+                    channels.Visible = not channels.Visible
+                end)
             end
 
             return entry
@@ -854,50 +1413,135 @@ do
 
         function group:AddSlider(id, info)
             open()
-
             local entry = register(Options, id, info.Default)
 
-            create(tab, "Slider", {
-                Name = info.Text,
-                Range = { info.Min, info.Max },
-                Increment = increment(info.Rounding),
-                Suffix = info.Suffix or "",
-                CurrentValue = info.Default,
-                Flag = id,
-                Callback = function(value)
+            local frame = row(page, 54)
+            place(frame)
+
+            local caption = rowLabel(frame, info.Text, UDim2.new(1, -20, 0, 24))
+            caption.TextYAlignment = Enum.TextYAlignment.Top
+
+            local readout = make("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0),
+                Position = UDim2.new(1, -10, 0, 0),
+                Size = UDim2.new(0, 110, 0, 24),
+                BackgroundTransparency = 1,
+                Font = Enum.Font.GothamBold,
+                TextSize = 15,
+                TextColor3 = THEME.accent,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                Text = "",
+            }, frame)
+
+            local decimals = info.Rounding or 0
+            local function show(value)
+                readout.Text = ("%." .. decimals .. "f%s"):format(value, info.Suffix or "")
+            end
+            show(info.Default)
+
+            local handle = bar(frame, UDim2.new(0, 10, 1, -16), UDim2.new(1, -20, 0, 10),
+                info.Min, info.Max, info.Rounding, info.Default, function(value)
                     entry.Value = value
-                    if info.Callback then info.Callback(value) end
-                end,
-            })
+                    show(value)
+                    if info.Callback then task.spawn(info.Callback, value) end
+                end)
+
+            -- Used when a saved config is applied.
+            entry.SetValue = function(_, value)
+                if typeof(value) ~= "number" then return end
+                entry.Value = value
+                handle.set(value)
+                show(value)
+                if info.Callback then task.spawn(info.Callback, value) end
+            end
 
             return entry
         end
 
         function group:AddDropdown(id, info)
             open()
-
             local values = info.Values or {}
-            local default = values[info.Default or 1]
-            local entry = register(Options, id, default)
+            local entry = register(Options, id, values[info.Default or 1])
 
-            local dropdown = create(tab, "Dropdown", {
-                Name = info.Text,
-                Options = values,
-                CurrentOption = default and { default } or {},
-                MultipleOptions = info.Multi == true,
-                Flag = id,
-                Callback = function(selection)
-                    -- Rayfield hands back a table even for single selection.
-                    local value = typeof(selection) == "table" and selection[1] or selection
-                    entry.Value = value
-                    if info.Callback then info.Callback(value) end
-                end,
-            })
+            local frame = row(page)
+            place(frame)
+            rowLabel(frame, info.Text, UDim2.new(0.5, -10, 1, 0))
+
+            local current = make("TextLabel", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, -10, 0.5, 0),
+                Size = UDim2.new(0.5, -10, 1, 0),
+                BackgroundTransparency = 1,
+                Font = Enum.Font.GothamBold,
+                TextSize = 15,
+                TextColor3 = THEME.text,
+                TextXAlignment = Enum.TextXAlignment.Right,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+                Text = tostring(entry.Value or "(none)"),
+            }, frame)
+
+            local list = make("Frame", {
+                Size = UDim2.new(1, 0, 0, 0),
+                AutomaticSize = Enum.AutomaticSize.Y,
+                BackgroundTransparency = 1,
+                Visible = false,
+            }, page)
+            place(list)
+            make("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, list)
+
+            local function rebuild(newValues)
+                for _, child in ipairs(list:GetChildren()) do
+                    if child:IsA("TextButton") then child:Destroy() end
+                end
+
+                for _, value in ipairs(newValues) do
+                    local option = round(make("TextButton", {
+                        Size = UDim2.new(1, 0, 0, 30),
+                        BackgroundColor3 = THEME.row,
+                        BackgroundTransparency = 0.4,
+                        Font = Enum.Font.Gotham,
+                        TextSize = 15,
+                        TextColor3 = THEME.text,
+                        Text = tostring(value),
+                        AutoButtonColor = false,
+                    }, list), 6)
+
+                    option.MouseButton1Click:Connect(function()
+                        entry.Value = value
+                        current.Text = tostring(value)
+                        list.Visible = false
+                        if info.Callback then task.spawn(info.Callback, value) end
+                    end)
+                end
+            end
+
+            rebuild(values)
+
+            local hit = make("TextButton", {
+                Size = UDim2.fromScale(1, 1),
+                BackgroundTransparency = 1,
+                Text = "",
+            }, frame)
+            hit.MouseButton1Click:Connect(function()
+                list.Visible = not list.Visible
+            end)
+
+            entry.SetValue = function(_, value)
+                entry.Value = value
+                current.Text = tostring(value)
+                if info.Callback then task.spawn(info.Callback, value) end
+            end
 
             entry.SetValues = function(_, newValues)
-                if not dropdown then return end
-                if pcall(function() dropdown:Refresh(newValues) end) then return end
-                pcall(function() dropdown:Refresh(newValues, {}) end)
+                rebuild(newValues)
+                local stillThere = false
+                for _, value in ipairs(newValues) do
+                    if value == entry.Value then stillThere = true break end
+                end
+                if not stillThere then
+                    entry.Value = newValues[1]
+                    current.Text = tostring(entry.Value or "(none)")
+                end
             end
 
             return entry
@@ -905,54 +1549,162 @@ do
 
         function group:AddInput(id, info)
             open()
-
             local entry = register(Options, id, info.Default or "")
 
-            create(tab, "Input", {
-                Name = info.Text,
-                CurrentValue = info.Default or "",
+            local frame = row(page)
+            place(frame)
+            rowLabel(frame, info.Text, UDim2.new(0.45, -10, 1, 0))
+
+            local box = round(make("TextBox", {
+                AnchorPoint = Vector2.new(1, 0.5),
+                Position = UDim2.new(1, -8, 0.5, 0),
+                Size = UDim2.new(0.5, 0, 0, 26),
+                BackgroundColor3 = THEME.black,
+                BackgroundTransparency = 0.2,
+                Font = Enum.Font.Gotham,
+                TextSize = 15,
+                TextColor3 = THEME.text,
                 PlaceholderText = info.Placeholder or "",
-                Numeric = false,
-                RemoveTextAfterFocusLost = false,
-                Flag = id,
-                Callback = function(text)
-                    entry.Value = text
-                    if info.Callback then info.Callback(text) end
-                end,
-            })
+                PlaceholderColor3 = THEME.dim,
+                Text = info.Default or "",
+                ClearTextOnFocus = false,
+            }, frame), 6)
+
+            box.FocusLost:Connect(function()
+                entry.Value = box.Text
+                if info.Callback then task.spawn(info.Callback, box.Text) end
+            end)
+
+            entry.SetValue = function(_, value)
+                entry.Value = tostring(value)
+                box.Text = entry.Value
+                if info.Callback then task.spawn(info.Callback, entry.Value) end
+            end
 
             return entry
         end
 
         function group:AddLabel(text)
             open()
+            local label = make("TextLabel", {
+                Size = UDim2.new(1, 0, 0, 0),
+                AutomaticSize = Enum.AutomaticSize.Y,
+                BackgroundTransparency = 1,
+                Font = Enum.Font.Gotham,
+                TextSize = 15,
+                TextColor3 = THEME.dim,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                TextWrapped = true,
+                Text = text,
+            })
+            place(label)
 
-            local label = create(tab, "Label", text)
             return {
-                SetText = function(_, newText)
-                    if label then pcall(function() label:Set(newText) end) end
-                end,
+                SetText = function(_, newText) label.Text = newText end,
             }
         end
 
         return group
     end
-end
 
-local function newTab(name)
-    local ok, tab = pcall(function()
-        return Window:CreateTab(name, TAB_ICON)
-    end)
-    if not ok or not tab then
-        warn(("[Sulfoxium Hub] CreateTab failed for %s: %s"):format(name, tostring(tab)))
-        tab = Window:CreateTab(name)
+    -- Tabs --------------------------------------------------------------------
+
+    local pages = {}
+
+    -- The tab you are on turns red and stays red until you pick another, eased
+    -- rather than snapped.
+    local function selectPage(page, button, name)
+        contentHeader.Text = name
+        for _, other in ipairs(pages) do
+            local active = other.button == button
+            other.page.Visible = other.page == page
+            tween(other.button, 0.16, {
+                BackgroundColor3 = active and THEME.tabOn or THEME.row,
+                BackgroundTransparency = active and 0.05 or 0.35,
+                TextColor3 = active and THEME.text or THEME.accent,
+            })
+        end
     end
 
-    local state = { current = nil }
-    return {
-        AddLeftGroupbox  = function(_, title) return newGroup(tab, state, title) end,
-        AddRightGroupbox = function(_, title) return newGroup(tab, state, title) end,
-        raw = tab,
+    function newTab(name)
+        local page = make("ScrollingFrame", {
+            Position = UDim2.fromOffset(0, 30),
+            Size = UDim2.new(1, 0, 1, -30),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ScrollBarThickness = 3,
+            ScrollBarImageColor3 = THEME.accent,
+            CanvasSize = UDim2.new(),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            Visible = false,
+        }, contentHolder)
+        padding(page, 10)
+        make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+
+        local button = round(make("TextButton", {
+            Size = UDim2.new(1, 0, 0, 33),
+            BackgroundColor3 = THEME.row,
+            BackgroundTransparency = 0.35,
+            Font = Enum.Font.GothamBold,
+            TextSize = 24,
+            TextColor3 = THEME.accent,
+            Text = name,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            AutoButtonColor = false,
+            LayoutOrder = #pages + 1,
+        }, sidebar), 9)
+        edge(button, THEME.border, 0.6)
+        make("UIPadding", { PaddingLeft = UDim.new(0, 10) }, button)
+
+        table.insert(pages, { page = page, button = button })
+        button.MouseButton1Click:Connect(function()
+            selectPage(page, button, name)
+        end)
+
+        if #pages == 1 then selectPage(page, button, name) end
+
+        local state = { current = nil, order = 1 }
+        return {
+            AddLeftGroupbox  = function(_, title) return newGroup(page, state, title) end,
+            AddRightGroupbox = function(_, title) return newGroup(page, state, title) end,
+        }
+    end
+
+    -- Live readouts -----------------------------------------------------------
+
+    do
+        local frames, elapsed, since = 0, 0, 0
+
+        Master:Add(RunService.RenderStepped:Connect(function(dt)
+            frames += 1
+            elapsed += dt
+            since += dt
+
+            if elapsed >= 0.5 then
+                fpsLabel.Text = ("%d fps"):format(math.floor(frames / elapsed + 0.5))
+                frames, elapsed = 0, 0
+            end
+
+            if since >= 1 then
+                since = 0
+                local ok, value = pcall(function()
+                    return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+                end)
+                pingLabel.Text = (ok and value) and ("%d ms"):format(math.floor(value + 0.5)) or "-- ms"
+            end
+        end))
+    end
+
+    -- Handed to the rest of the file.
+    UI = {
+        notify = showNotification,
+        destroy = function()
+            -- The cursor goes back to how the game had it even if the menu is
+            -- unloaded while open.
+            pcall(freeCursor, false)
+            pcall(function() screen:Destroy() end)
+        end,
+        setShown = setShown,
     }
 end
 
@@ -964,6 +1716,7 @@ local Tabs = {
     Night3   = newTab("Night 3"),
     Bunker   = newTab("The Bunker"),
     Server   = newTab("Server"),
+    Configs  = newTab("Configs"),
     Settings = newTab("UI Settings"),
 }
 
@@ -1992,14 +2745,14 @@ local ESP_CATEGORIES = {
     { key = "Zombies", text = "Zombies", default = Color3.fromRGB(120, 255, 120), names = { Zombie = true, BloodZombie = true, FrozenZombie = true, FrozenBloodZombie = true } },
     { key = "Abomination", text = "Abomination / Rat", default = Color3.fromRGB(255, 0, 255), names = { BunkerRat = true, Abomination = true, Monster = true } },
     { key = "Generators", text = "Generators", default = Color3.fromRGB(255, 170, 0), names = { Generator = true, Gen = true } },
-    -- Night 3 scatters far more cans than the three that matter, so the toggle
-    -- is not offered there. Every other place keeps it.
-    { key = "Fuel", text = "Fuel / JerryCan", default = Color3.fromRGB(0, 255, 120), names = { JerryCan = true, Gasoline = true, Fuel = true }, hideIn = { [NIGHT3_PLACE_ID] = true } },
     { key = "Monster", text = "Mutant Worker", default = Color3.fromRGB(255, 80, 0), names = { Mutant = true, Worker = true }, tab = "Night3" },
     { key = "WorkerHead", text = "WorkerHead", default = Color3.fromRGB(255, 230, 0), names = { WorkerHead = true }, tab = "Night3" },
-    -- Night 3's own can ESP: only ones that have actually spawned and are still
-    -- there, which is why the Fuel category above is hidden in that place.
-    { key = "JerryCan", text = "JerryCan", default = Color3.fromRGB(0, 255, 120), names = { JerryCan = true }, tab = "Night3", filter = isLiveJerryCan },
+    -- Replaces the old Fuel category, which matched any Model or part named
+    -- Fuel or Gasoline and lit up spawn markers and generator internals. This
+    -- one only counts cans that have actually spawned and are still there to
+    -- collect, and that test holds in every place, so it lives here rather than
+    -- in one tab.
+    { key = "JerryCan", text = "JerryCan", default = Color3.fromRGB(0, 255, 120), names = { JerryCan = true }, filter = isLiveJerryCan },
     -- Wood and Log used to live here: they are not pickups, and bed frames are
     -- built out of parts using those names, which is why beds lit up too.
     { key = "Items", text = "Items / Pickups", default = Color3.fromRGB(255, 255, 120), names = { Battery = true, Flashlight = true, Medkit = true, Bandage = true, Key = true, Keycard = true, Marshmallow = true }, filter = notNestedInMatch },
@@ -4087,25 +4840,12 @@ do
     end)
 
     Button(ActGroup, "Teleport To Safe Spot", "Teleports you to 194.70, 38.70, -215.17", function()
-        local char, root = Char.require()
-        local target = CFrame.new(SAFE_SPOT) * root.CFrame.Rotation
+        local _, root = Char.require()
 
         pushPosition()
-        char:PivotTo(target)
-        zeroVelocity(root)
-
-        -- A jump this far made in a single frame gets rubber-banded: the server
-        -- rejects the new position and drags you back a moment later, which is
-        -- the half-second round trip. Re-asserting the position for a short
-        -- while makes it stick, and the velocity is zeroed each time so nothing
-        -- carries you off the spot once the hold ends.
-        local deadline = os.clock() + 0.75
-        while os.clock() < deadline do
-            RunService.Heartbeat:Wait()
-            if not root.Parent then return end
-            root.CFrame = target
-            zeroVelocity(root)
-        end
+        -- Held longer than the default: this is the furthest jump in the script
+        -- and the one the server pushed back on hardest.
+        pivotTo(CFrame.new(SAFE_SPOT) * root.CFrame.Rotation, 0.75)
 
         notify("Teleported to the safe spot. '< Return' brings you back.")
     end)
@@ -4184,12 +4924,188 @@ do
     end
 end
 
+-- Configs ---------------------------------------------------------------------
+-- Every toggle and every slider, dropdown, input and colour is written to one
+-- file per config. An index file lists them, so no executor-specific directory
+-- listing is needed. Scoped so its locals are released.
+do
+    local ConfigGroup = Tabs.Configs:AddLeftGroupbox("Saved Configs")
+
+    local FOLDER = CONFIG.SETTINGS_FOLDER .. "/configs"
+    local INDEX  = FOLDER .. "/index.json"
+
+    -- Dropdown selections that are rebuilt from the world each session, and the
+    -- name box itself: restoring these would only put back stale entries.
+    local SKIP = {
+        WaypointName = true, WaypointList = true, PlayerList = true,
+        N3SpotName = true, N3SpotList = true, ConfigName = true, ConfigList = true,
+    }
+
+    local names, listDropdown = {}, nil
+
+    local function path(name)
+        return ("%s/%s.json"):format(FOLDER, name)
+    end
+
+    local function encode(value)
+        if typeof(value) == "Color3" then
+            return { __color = {
+                math.floor(value.R * 255 + 0.5),
+                math.floor(value.G * 255 + 0.5),
+                math.floor(value.B * 255 + 0.5),
+            } }
+        end
+        return value
+    end
+
+    local function decode(value)
+        if typeof(value) == "table" and value.__color then
+            return Color3.fromRGB(value.__color[1], value.__color[2], value.__color[3])
+        end
+        return value
+    end
+
+    local function refresh()
+        if not listDropdown then return end
+        local shown = #names > 0 and names or { "(none)" }
+        pcall(function() listDropdown:SetValues(shown) end)
+    end
+
+    local function saveIndex()
+        table.sort(names)
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(names) end)
+        if ok then Exec.write(INDEX, encoded) end
+        refresh()
+    end
+
+    local function loadIndex()
+        local contents = Exec.read(INDEX)
+        if not contents then return end
+        local ok, decoded = pcall(function() return HttpService:JSONDecode(contents) end)
+        if ok and typeof(decoded) == "table" then
+            for _, name in ipairs(decoded) do
+                if Exec.read(path(name)) then table.insert(names, name) end
+            end
+        end
+        refresh()
+    end
+
+    ConfigGroup:AddInput("ConfigName", {
+        Text = "Config name",
+        Default = "",
+        Placeholder = "e.g. night 3 setup",
+    })
+
+    listDropdown = ConfigGroup:AddDropdown("ConfigList", {
+        Values = { "(none)" },
+        Default = 1,
+        Multi = false,
+        Text = "Saved configs",
+    })
+
+    Button(ConfigGroup, "Save Config", "Writes every toggle and value under the name above", function()
+        if not Exec.hasFiles then
+            return notify("This executor has no file access, so configs cannot be saved.", 6)
+        end
+
+        local name = opt("ConfigName", "")
+        if name == nil or name == "" then
+            return notify("Type a config name first.")
+        end
+
+        local data = { toggles = {}, options = {} }
+        for id, entry in pairs(Toggles) do
+            if not SKIP[id] then data.toggles[id] = entry.Value == true end
+        end
+        for id, entry in pairs(Options) do
+            if not SKIP[id] and entry.Value ~= nil then
+                data.options[id] = encode(entry.Value)
+            end
+        end
+
+        local ok, encoded = pcall(function() return HttpService:JSONEncode(data) end)
+        if not ok then return notify("Could not encode this config.", 5) end
+
+        Exec.ensureFolder(CONFIG.SETTINGS_FOLDER)
+        Exec.ensureFolder(FOLDER)
+        if not Exec.write(path(name), encoded) then
+            return notify("Could not write the config file.", 5)
+        end
+
+        local known = false
+        for _, existing in ipairs(names) do
+            if existing == name then known = true break end
+        end
+        if not known then table.insert(names, name) end
+        saveIndex()
+
+        notify(("Saved config '%s'."):format(name))
+    end)
+
+    Button(ConfigGroup, "Load Config", "Applies the selected config", function()
+        local name = opt("ConfigList")
+        if not name or name == "(none)" then return notify("No config selected.") end
+
+        local contents = Exec.read(path(name))
+        if not contents then return notify(("Config '%s' is missing."):format(name), 5) end
+
+        local ok, data = pcall(function() return HttpService:JSONDecode(contents) end)
+        if not ok or typeof(data) ~= "table" then
+            return notify("That config file could not be read.", 5)
+        end
+
+        local applied = 0
+
+        -- Values first, so a toggle that switches a feature on already sees the
+        -- sliders and colours it depends on.
+        for id, value in pairs(data.options or {}) do
+            local entry = not SKIP[id] and Options[id]
+            if entry and entry.SetValue then
+                if pcall(function() entry:SetValue(decode(value)) end) then applied += 1 end
+            end
+        end
+
+        for id, value in pairs(data.toggles or {}) do
+            local entry = not SKIP[id] and Toggles[id]
+            if entry and entry.SetValue then
+                if pcall(function() entry:SetValue(value == true) end) then applied += 1 end
+            end
+        end
+
+        notify(("Loaded '%s' — %d setting(s) applied."):format(name, applied), 5)
+    end)
+
+    Button(ConfigGroup, "Delete Config", "Removes the selected config", function()
+        local name = opt("ConfigList")
+        if not name or name == "(none)" then return notify("No config selected.") end
+
+        Exec.delete(path(name))
+        for index, existing in ipairs(names) do
+            if existing == name then
+                table.remove(names, index)
+                break
+            end
+        end
+        saveIndex()
+
+        notify(("Deleted config '%s'."):format(name))
+    end)
+
+    Button(ConfigGroup, "Refresh List", "Re-reads the config folder", function()
+        names = {}
+        loadIndex()
+        notify(("%d config(s) found."):format(#names))
+    end)
+
+    ConfigGroup:AddLabel("Configs are saved per executor, not per place, so one setup works across every night.")
+
+    loadIndex()
+end
+
 local MenuGroup  = Tabs.Settings:AddLeftGroupbox("Menu")
 local PanicGroup = Tabs.Settings:AddRightGroupbox("Panic")
 
--- Rayfield opens and closes itself on the keybind given to CreateWindow, and it
--- has no watermark or keybind list, so those three controls have no equivalent.
-MenuGroup:AddLabel("Menu bind: Left Control")
+MenuGroup:AddLabel("Use the Show Sulfoxium button at the top of the screen")
 
 local panicked = false
 
@@ -4257,7 +5173,7 @@ local function panic(reason)
         end
     end
 
-    pcall(function() Rayfield:Destroy() end)
+    pcall(function() UI.destroy() end)
     warn("[Sulfoxium Hub] Unloaded (" .. tostring(reason) .. ")")
 end
 
@@ -4295,8 +5211,6 @@ end))
 
 refreshWaypointDropdown()
 refreshPlayerDropdown()
-
-pcall(function() Rayfield:LoadConfiguration() end)
 
 -- Only now may anything unload the menu.
 uiReady = true
